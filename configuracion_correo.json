@@ -1,0 +1,7 @@
+{
+  "host": "smtp.gmail.com",
+  "puerto": 587,
+  "usuario": "tareapoo2026grupo7enviocorreo@gmail.com",
+  "clave": "qaagyhxtssyynbqx",
+  "remitente": "tareapoo2026grupo7enviocorreo@gmail.com"
+}
