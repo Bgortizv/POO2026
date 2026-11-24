@@ -4,6 +4,7 @@ Diseño físico: SQLite conserva libros, usuarios y préstamos; el estado vencid
 se calcula a partir de la fecha pactada. Los comprobantes se guardan en PDF.
 """
 import os
+import json
 import re
 import sqlite3
 import smtplib
@@ -15,6 +16,7 @@ from pathlib import Path
 CARPETA = Path(__file__).resolve().parent
 BASE_DATOS = 'BaseDeDatosAplicacion.db'
 COMPROBANTES = CARPETA / 'comprobantes'
+CONFIGURACION_CORREO = CARPETA / 'configuracion_correo.json'
 
 
 def conectar(ruta=BASE_DATOS):
@@ -281,13 +283,28 @@ def pdf_comprobante(fila):
 
 
 def enviar_comprobante(fila, ruta):
+    # Una configuración completa en variables de entorno tiene prioridad sobre el archivo local.
     host = os.environ.get('BIBLIOTECA_SMTP_HOST', '').strip()
     usuario = os.environ.get('BIBLIOTECA_SMTP_USUARIO', '').strip()
     clave = os.environ.get('BIBLIOTECA_SMTP_CLAVE', '')
-    remitente = os.environ.get('BIBLIOTECA_SMTP_REMITENTE', usuario).strip()
-    if not all((host, usuario, clave, remitente)):
-        raise ValueError('Configure las variables SMTP indicadas en la documentación.')
-    puerto = int(os.environ.get('BIBLIOTECA_SMTP_PUERTO', '587'))
+    if all((host, usuario, clave)):
+        puerto = int(os.environ.get('BIBLIOTECA_SMTP_PUERTO', '587'))
+        remitente = os.environ.get('BIBLIOTECA_SMTP_REMITENTE', usuario).strip()
+    else:
+        try:
+            with CONFIGURACION_CORREO.open(encoding='utf-8') as archivo:
+                configuracion = json.load(archivo)
+            host = configuracion['host'].strip()
+            usuario = configuracion['usuario'].strip()
+            clave = configuracion['clave']
+            remitente = configuracion.get('remitente', '').strip() or usuario
+            puerto = int(configuracion.get('puerto', 587))
+            if not all(isinstance(dato, str) and dato for dato in (host, usuario, clave, remitente)):
+                raise ValueError('Configuración incompleta')
+        except (OSError, KeyError, TypeError, AttributeError, ValueError) as error:
+            raise ValueError('Revise la configuración local del correo según el README.') from error
+    if not 1 <= puerto <= 65535:
+        raise ValueError('Puerto SMTP inválido.')
     mensaje = EmailMessage()
     mensaje['Subject'] = f'Comprobante de préstamo {fila["numero"]}'
     mensaje['From'] = remitente
@@ -310,7 +327,7 @@ def comprobante(con, numero):
         print('Préstamo no encontrado.'); return
     try:
         ruta = pdf_comprobante(fila)
-        print('Comprobante generado:', ruta)
+        print('Comprobante PDF generado:', ruta.name)
         enviar_comprobante(fila, ruta)
         print('Comprobante enviado a', fila['correo'])
     except (OSError, ValueError, smtplib.SMTPException):
@@ -321,7 +338,8 @@ def comprobante(con, numero):
 def registrar_prestamo(con):
     documento = digitos('Digite el documento del usuario que solicita el préstamo')
     libro = texto('Digite el identificador del libro que desea prestar')
-    inicio = fecha('Fecha de inicio')
+    inicio = date.today().isoformat()
+    print('Fecha de inicio del préstamo:', fecha_visible(inicio))
     while True:
         devolucion = fecha('Fecha de devolución')
         if devolucion >= inicio:
