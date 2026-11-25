@@ -3,23 +3,25 @@
 Diseño físico: SQLite conserva libros, usuarios y préstamos; el estado vencido
 se calcula a partir de la fecha pactada. Los comprobantes se guardan en PDF.
 """
-import os
-import json
-import re
-import sqlite3
-import smtplib
-import ssl
-import unicodedata
-from datetime import date, datetime
-from email.message import EmailMessage
-from pathlib import Path
+import os  # Consulta variables de entorno para configurar el correo.
+import json  # Lee la configuración del correo guardada en un archivo JSON.
+import re  # Valida formatos de datos mediante expresiones regulares.
+import sqlite3  # Permite trabajar con la base de datos SQLite.
+import smtplib  # Envía los correos al servidor SMTP.
+import ssl  # Protege la conexión con el servidor de correo.
+import unicodedata  # Normaliza distintas formas de escribir tildes.
+from datetime import date, datetime  # Manejan la fecha actual y validan fechas.
+from email.message import EmailMessage  # Construye el correo y permite adjuntar el PDF.
+from pathlib import Path  # Facilita el manejo de rutas de archivos y carpetas.
 
+# Obtiene la carpeta que contiene este archivo Python.
 CARPETA = Path(__file__).resolve().parent
 BASE_DATOS = 'BaseDeDatosAplicacion.db'
 COMPROBANTES = CARPETA / 'comprobantes'
 CONFIGURACION_CORREO = CARPETA / 'configuracion_correo.json'
 
 
+# Convierte un texto a mayúsculas y unifica las distintas formas de escribir una tilde.
 def mayusculas(valor):
     """Normaliza tildes equivalentes y convierte letras Unicode a mayúsculas."""
     if valor is None:
@@ -27,11 +29,14 @@ def mayusculas(valor):
     return unicodedata.normalize('NFC', unicodedata.normalize('NFC', valor).upper())
 
 
+# Abre la base de datos y crea las tablas necesarias si todavía no existen.
 def conectar(ruta=BASE_DATOS):
     conexion = sqlite3.connect(str(ruta))
+    # Permite consultar cada columna por su nombre, por ejemplo fila["titulo"].
     conexion.row_factory = sqlite3.Row
     # UPPER de SQLite solo reconoce ASCII; se utiliza el upper Unicode de Python.
     conexion.create_function('UPPER', 1, mayusculas)
+    # Activa la validación de relaciones: un préstamo debe tener libro y usuario existentes.
     conexion.execute('PRAGMA foreign_keys = ON')
     conexion.executescript('''
     CREATE TABLE IF NOT EXISTS libros (
@@ -47,14 +52,11 @@ def conectar(ruta=BASE_DATOS):
         libro_id TEXT NOT NULL REFERENCES libros(id),
         fecha_inicio TEXT NOT NULL, fecha_devolucion TEXT NOT NULL,
         devuelto INTEGER NOT NULL DEFAULT 0 CHECK(devuelto IN (0,1)));
-    CREATE UNIQUE INDEX IF NOT EXISTS prestamo_abierto_libro
-        ON prestamos(libro_id) WHERE devuelto = 0;
-    CREATE UNIQUE INDEX IF NOT EXISTS prestamo_abierto_usuario
-        ON prestamos(documento) WHERE devuelto = 0;
     ''')
     return conexion
 
 
+# Solicita un texto obligatorio, lo valida y lo convierte a mayúsculas.
 def texto(etiqueta):
     while True:
         valor = input(etiqueta + ': ').strip()
@@ -64,6 +66,7 @@ def texto(etiqueta):
         print('Digite un valor válido de 1 a 120 caracteres imprimibles.')
 
 
+# Solicita un número de documento o teléfono y acepta únicamente dígitos.
 def digitos(etiqueta):
     # Los números de documento y teléfono se conservan como texto para mantener ceros iniciales.
     while True:
@@ -73,6 +76,7 @@ def digitos(etiqueta):
         print('Digite un valor válido: use entre 1 y 30 dígitos, sin espacios ni signos.')
 
 
+# Solicita una fecha válida en formato día/mes/año y la guarda en formato ISO.
 def fecha(etiqueta):
     while True:
         valor = texto(etiqueta + ' (dd/mm/aaaa)')
@@ -84,14 +88,17 @@ def fecha(etiqueta):
             print('Digite una fecha válida en formato dd/mm/aaaa, por ejemplo 05/11/2026.')
 
 
+# Convierte una fecha guardada en formato ISO al formato día/mes/año.
 def fecha_visible(valor):
     return date.fromisoformat(valor).strftime('%d/%m/%Y')
 
 
+# Comprueba si el correo tiene una estructura válida antes de guardarlo.
 def correo_valido(valor):
     return bool(re.fullmatch(r'[A-Z0-9!#$%&*+/=?^_`{|}~-]+(?:\.[A-Z0-9!#$%&*+/=?^_`{|}~-]+)*@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+', valor.upper()))
 
 
+# Solicita el correo hasta que el usuario digite uno con formato válido.
 def pedir_correo():
     while True:
         valor = texto('Correo electrónico')
@@ -100,6 +107,7 @@ def pedir_correo():
         print('Digite un correo válido, por ejemplo USUARIO@EJEMPLO.COM.')
 
 
+# Muestra los datos de un registro con etiquetas o avisa si no existe.
 def mostrar(fila, etiquetas):
     if fila is None:
         print('Registro no encontrado.')
@@ -117,6 +125,7 @@ ETIQUETAS_USUARIO = [('documento','Documento'), ('nombre','Nombre'), ('apellido'
                      ('direccion','Dirección'), ('telefono','Teléfono'), ('correo','Correo')]
 
 
+# Solicita los datos de un libro y lo guarda como disponible.
 def registrar_libro(con):
     datos = (texto('Identificador'), texto('Título'), texto('Autor'), texto('Género'), fecha('Fecha de publicación'))
     if con.execute('SELECT 1 FROM libros WHERE UPPER(id) = UPPER(?)', (datos[0],)).fetchone():
@@ -126,6 +135,7 @@ def registrar_libro(con):
     print('Libro registrado como disponible.')
 
 
+# Muestra el estado del libro y permite cambiarlo o cancelar cuando corresponda.
 def actualizar_estado(con):
     identificador = texto('Digite el identificador del libro cuyo estado desea modificar')
     libro = con.execute('SELECT * FROM libros WHERE UPPER(id) = UPPER(?)', (identificador,)).fetchone()
@@ -151,11 +161,13 @@ def actualizar_estado(con):
     print('Estado actualizado.')
 
 
+# Busca un libro por identificador y muestra su estado o todos sus datos.
 def consultar_libro(con, solo_estado=False):
     libro = con.execute('SELECT * FROM libros WHERE UPPER(id) = UPPER(?)', (texto('Digite el identificador del libro que desea consultar'),)).fetchone()
     mostrar(libro, [('id','Identificador'), ('titulo','Título'), ('estado','Estado')] if solo_estado else ETIQUETAS_LIBRO)
 
 
+# Muestra hasta 100 libros para ayudar a encontrar sus identificadores.
 def listar_libros(con):
     """Muestra una muestra de hasta 100 libros para encontrar sus identificadores."""
     filas = con.execute('SELECT id, titulo, autor, estado FROM libros ORDER BY titulo, id LIMIT 100').fetchall()
@@ -167,6 +179,7 @@ def listar_libros(con):
         print(f"Identificador: {libro['id']} | Título: {libro['titulo']} | Autor: {libro['autor']} | Estado: {libro['estado']}")
 
 
+# Solicita los datos de un usuario y los guarda en la base de datos.
 def registrar_usuario(con):
     datos = (digitos('Documento'), texto('Nombre'), texto('Apellido'), texto('Dirección'), digitos('Teléfono'), pedir_correo())
     con.execute('INSERT INTO usuarios VALUES (?, ?, ?, ?, ?, ?)', datos)
@@ -174,6 +187,7 @@ def registrar_usuario(con):
     print('Usuario registrado.')
 
 
+# Muestra el contacto actual y permite modificar un dato o cancelar.
 def actualizar_contacto(con):
     documento = digitos('Digite el documento del usuario cuyo contacto desea modificar')
     usuario = con.execute('SELECT * FROM usuarios WHERE UPPER(documento) = UPPER(?)', (documento,)).fetchone()
@@ -204,10 +218,12 @@ def actualizar_contacto(con):
     print('Contacto actualizado.')
 
 
+# Busca un usuario por su documento y muestra sus datos registrados.
 def consultar_usuario(con):
     mostrar(con.execute('SELECT * FROM usuarios WHERE UPPER(documento) = UPPER(?)', (digitos('Digite el documento del usuario que desea consultar'),)).fetchone(), ETIQUETAS_USUARIO)
 
 
+# Muestra hasta 100 usuarios para ayudar a encontrar sus documentos.
 def listar_usuarios(con):
     """Muestra hasta 100 usuarios para localizar su número de documento."""
     filas = con.execute('SELECT documento, nombre, apellido FROM usuarios ORDER BY apellido, nombre, documento LIMIT 100').fetchall()
@@ -219,12 +235,14 @@ def listar_usuarios(con):
         print(f"Documento: {usuario['documento']} | Nombre: {usuario['nombre']} {usuario['apellido']}")
 
 
+# Calcula si un préstamo está vigente, vencido o devuelto.
 def estado_prestamo(fila, hoy=None):
     if fila['devuelto']:
         return 'devuelto'
     return 'vencido' if date.fromisoformat(fila['fecha_devolucion']) < (hoy or date.today()) else 'vigente'
 
 
+# Valida el usuario, el libro y las fechas; guarda el préstamo y marca el libro prestado.
 def crear_prestamo(con, documento, libro_id, inicio, devolucion):
     """Valida y registra préstamo y cambio de estado en una misma transacción."""
     if date.fromisoformat(devolucion) < date.fromisoformat(inicio):
@@ -238,8 +256,12 @@ def crear_prestamo(con, documento, libro_id, inicio, devolucion):
             raise ValueError('Usuario no encontrado.')
         if not libro:
             raise ValueError('Libro no encontrado.')
+        if libro['estado'] == 'prestado':
+            raise ValueError('El libro está en préstamo.')
         if libro['estado'] != 'disponible':
-            raise ValueError('El libro no está disponible.')
+            raise ValueError('El libro está en mantenimiento y no está disponible.')
+        if con.execute('SELECT 1 FROM prestamos WHERE libro_id = ? AND devuelto = 0', (libro['id'],)).fetchone():
+            raise ValueError('El libro está en préstamo.')
         if con.execute('SELECT 1 FROM prestamos WHERE UPPER(documento) = UPPER(?) AND devuelto = 0', (documento,)).fetchone():
             raise ValueError('El usuario tiene un préstamo sin devolver.')
         cursor = con.execute('INSERT INTO prestamos(documento, libro_id, fecha_inicio, fecha_devolucion) VALUES (?, ?, ?, ?)',
@@ -248,6 +270,7 @@ def crear_prestamo(con, documento, libro_id, inicio, devolucion):
         return cursor.lastrowid
 
 
+# Reúne los datos del préstamo, el usuario y el libro mediante sus relaciones.
 def datos_prestamo(con, numero):
     return con.execute('''SELECT p.*, u.nombre, u.apellido, u.direccion, u.telefono, u.correo,
                           l.titulo, l.autor FROM prestamos p
@@ -255,6 +278,7 @@ def datos_prestamo(con, numero):
                           JOIN libros l ON l.id = p.libro_id WHERE p.numero = ?''', (numero,)).fetchone()
 
 
+# Crea y guarda el comprobante PDF con los datos del préstamo.
 def pdf_comprobante(fila):
     """Construye un PDF de una página con Helvetica, sin dependencias externas."""
     COMPROBANTES.mkdir(exist_ok=True)
@@ -292,6 +316,7 @@ def pdf_comprobante(fila):
     return ruta
 
 
+# Lee la configuración SMTP y envía el PDF adjunto al correo del usuario.
 def enviar_comprobante(fila, ruta):
     # Una configuración completa en variables de entorno tiene prioridad sobre el archivo local.
     host = os.environ.get('BIBLIOTECA_SMTP_HOST', '').strip()
@@ -331,6 +356,7 @@ def enviar_comprobante(fila, ruta):
             servidor.login(usuario, clave); servidor.send_message(mensaje)
 
 
+# Genera el PDF, intenta enviarlo y avisa si ocurre un error.
 def comprobante(con, numero):
     fila = datos_prestamo(con, numero)
     if not fila:
@@ -342,9 +368,10 @@ def comprobante(con, numero):
         print('Comprobante enviado a', fila['correo'])
     except (OSError, ValueError, smtplib.SMTPException):
         print('No fue posible generar o enviar el comprobante. Revise la configuración y vuelva a intentarlo.')
-        print('El préstamo se conserva. Puede reintentar desde el menú de préstamos.')
+        print('El préstamo se conserva. Puede reintentar el envío del comprobante desde el menú de préstamos.')
 
 
+# Solicita los datos del préstamo, usa la fecha actual y genera el comprobante.
 def registrar_prestamo(con):
     documento = digitos('Digite el documento del usuario que solicita el préstamo')
     libro = texto('Digite el identificador del libro que desea prestar')
@@ -360,6 +387,7 @@ def registrar_prestamo(con):
     comprobante(con, numero)
 
 
+# Registra la devolución y cambia el estado del libro a disponible.
 def devolver(con, numero):
     with con:
         con.execute('BEGIN IMMEDIATE')
@@ -373,6 +401,7 @@ def devolver(con, numero):
     print('Devolución registrada; libro disponible.')
 
 
+# Muestra el préstamo y permite confirmar o cancelar su devolución.
 def registrar_devolucion(con):
     numero = numero_prestamo('devolver')
     fila = datos_prestamo(con, numero)
@@ -395,6 +424,7 @@ def registrar_devolucion(con):
     devolver(con, numero)
 
 
+# Solicita el número de préstamo hasta que sea un entero positivo válido.
 def numero_prestamo(operacion='consultar'):
     while True:
         valor = texto('Digite el número del préstamo que desea ' + operacion + ' (entero positivo)')
@@ -404,6 +434,7 @@ def numero_prestamo(operacion='consultar'):
         print('Digite un número de préstamo válido: entero positivo hasta 9223372036854775807.')
 
 
+# Muestra el historial de un usuario en páginas de hasta 100 préstamos.
 def consultar_prestamos(con):
     documento = digitos('Digite el documento del usuario cuyos préstamos desea consultar')
     if not con.execute('SELECT 1 FROM usuarios WHERE UPPER(documento) = UPPER(?)', (documento,)).fetchone():
@@ -443,6 +474,7 @@ def consultar_prestamos(con):
         pagina += 1
 
 
+# Muestra hasta 100 préstamos recientes para encontrar sus números.
 def listar_prestamos(con):
     """Muestra hasta 100 préstamos recientes, incluidos sus identificadores."""
     filas = con.execute('''SELECT p.*, l.titulo FROM prestamos p
@@ -457,6 +489,7 @@ def listar_prestamos(con):
               f"Libro: {fila['libro_id']} - {fila['titulo']} | Estado: {estado_prestamo(fila)}")
 
 
+# Presenta las opciones de un menú y ejecuta la opción elegida.
 def menu(con, titulo, opciones):
     while True:
         print('\n' + titulo)
@@ -481,6 +514,7 @@ def menu(con, titulo, opciones):
             print('No se pudo acceder a la base de datos. Intente nuevamente.')
 
 
+# Conecta la base de datos, organiza los menús y cierra la conexión al salir.
 def main():
     con = conectar()
     try:
