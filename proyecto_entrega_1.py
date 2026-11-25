@@ -1,420 +1,565 @@
-"""Pruebas ejecutables con unittest y únicamente la biblioteca estándar."""
-import contextlib
-import datetime
-import importlib.util
-import io
-import json
-import os
-import sqlite3
-import subprocess
-import sys
-import tempfile
-import unittest
-from pathlib import Path
-from unittest.mock import patch
+"""Gestión de biblioteca por consola. Python 3.9+, solo biblioteca estándar.
 
-ARCHIVO = Path(__file__).resolve().parent.parent / 'proyecto_entrega_1.py'
-spec = importlib.util.spec_from_file_location('biblioteca', ARCHIVO)
-app = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(app)
+Diseño físico: SQLite conserva libros, usuarios y préstamos; el estado vencido
+se calcula a partir de la fecha pactada. Los comprobantes se guardan en PDF.
+"""
+import os  # Consulta variables de entorno para configurar el correo.
+import json  # Lee la configuración del correo guardada en un archivo JSON.
+import re  # Valida formatos de datos mediante expresiones regulares.
+import sqlite3  # Permite trabajar con la base de datos SQLite.
+import smtplib  # Envía los correos al servidor SMTP.
+import ssl  # Protege la conexión con el servidor de correo.
+import unicodedata  # Normaliza distintas formas de escribir tildes.
+from datetime import date, datetime  # Manejan la fecha actual y validan fechas.
+from email.message import EmailMessage  # Construye el correo y permite adjuntar el PDF.
+from pathlib import Path  # Facilita el manejo de rutas de archivos y carpetas.
 
-
-def probar_entrada(funcion, valores):
-    salida = io.StringIO()
-    with patch('builtins.input', side_effect=valores), contextlib.redirect_stdout(salida):
-        resultado = funcion()
-    return resultado, salida.getvalue()
+# Obtiene la carpeta que contiene este archivo Python.
+CARPETA = Path(__file__).resolve().parent
+BASE_DATOS = 'BaseDeDatosAplicacion.db'
+COMPROBANTES = CARPETA / 'comprobantes'
+CONFIGURACION_CORREO = CARPETA / 'configuracion_correo.json'
 
 
-def base():
-    con = app.conectar(':memory:')
-    con.executemany('INSERT INTO usuarios VALUES (?, ?, ?, ?, ?, ?)', [
-        ('1', 'ANA', 'PÉREZ', 'CALLE 1', '123', 'ANA@EJEMPLO.COM'),
-        ('2', 'LUIS', 'DÍAZ', 'CALLE 2', '456', 'LUIS@EJEMPLO.COM')])
-    con.executemany('INSERT INTO libros VALUES (?, ?, ?, ?, ?, ?)', [
-        ('L1', 'LIBRO UNO', 'AUTOR', 'CIENCIA', '2020-01-01', 'disponible'),
-        ('L2', 'LIBRO DOS', 'AUTOR', 'CIENCIA', '2020-01-01', 'disponible'),
-        ('L3', 'TERCERO', 'AUTOR', 'CIENCIA', '2020-01-01', 'en mantenimiento')])
+# Convierte un texto a mayúsculas y unifica las distintas formas de escribir una tilde.
+def mayusculas(valor):
+    """Normaliza tildes equivalentes y convierte letras Unicode a mayúsculas."""
+    if valor is None:
+        return None
+    return unicodedata.normalize('NFC', unicodedata.normalize('NFC', valor).upper())
+
+
+# Abre la base de datos y crea las tablas necesarias si todavía no existen.
+def conectar(ruta=BASE_DATOS):
+    conexion = sqlite3.connect(str(ruta))
+    # Permite consultar cada columna por su nombre, por ejemplo fila["titulo"].
+    conexion.row_factory = sqlite3.Row
+    # UPPER de SQLite solo reconoce ASCII; se utiliza el upper Unicode de Python.
+    conexion.create_function('UPPER', 1, mayusculas)
+    # Activa la validación de relaciones: un préstamo debe tener libro y usuario existentes.
+    conexion.execute('PRAGMA foreign_keys = ON')
+    conexion.executescript('''
+    CREATE TABLE IF NOT EXISTS libros (
+        id TEXT PRIMARY KEY, titulo TEXT NOT NULL, autor TEXT NOT NULL,
+        genero TEXT NOT NULL, fecha_publicacion TEXT NOT NULL,
+        estado TEXT NOT NULL CHECK(estado IN ('disponible','prestado','en mantenimiento')));
+    CREATE TABLE IF NOT EXISTS usuarios (
+        documento TEXT PRIMARY KEY, nombre TEXT NOT NULL, apellido TEXT NOT NULL,
+        direccion TEXT NOT NULL, telefono TEXT NOT NULL, correo TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS prestamos (
+        numero INTEGER PRIMARY KEY AUTOINCREMENT,
+        documento TEXT NOT NULL REFERENCES usuarios(documento),
+        libro_id TEXT NOT NULL REFERENCES libros(id),
+        fecha_inicio TEXT NOT NULL, fecha_devolucion TEXT NOT NULL,
+        devuelto INTEGER NOT NULL DEFAULT 0 CHECK(devuelto IN (0,1)));
+    ''')
+    return conexion
+
+
+# Solicita un texto obligatorio, lo valida y lo convierte a mayúsculas.
+def texto(etiqueta):
+    while True:
+        valor = input(etiqueta + ' (o /CANCELAR para volver): ').strip()
+        valor = mayusculas(valor)
+        if valor == '/CANCELAR':
+            raise InterruptedError('cancelacion_solicitada')
+        if valor and len(valor) <= 120 and all(c.isprintable() for c in valor):
+            return valor
+        print('Digite un valor válido de 1 a 120 caracteres imprimibles.')
+
+
+# Solicita un número de documento o teléfono y acepta únicamente dígitos.
+def digitos(etiqueta):
+    # Los números de documento y teléfono se conservan como texto para mantener ceros iniciales.
+    while True:
+        valor = texto(etiqueta + ' (solo dígitos)')
+        if re.fullmatch(r'[0-9]{1,30}', valor):
+            return valor
+        print('Digite un valor válido: use entre 1 y 30 dígitos, sin espacios ni signos.')
+
+
+# Solicita una fecha válida en formato día/mes/año y la guarda en formato ISO.
+def fecha(etiqueta):
+    while True:
+        valor = texto(etiqueta + ' (dd/mm/aaaa)')
+        try:
+            if not re.fullmatch(r'[0-9]{2}/[0-9]{2}/[0-9]{4}', valor):
+                raise ValueError
+            return datetime.strptime(valor, '%d/%m/%Y').date().isoformat()
+        except ValueError:
+            print('Digite una fecha válida en formato dd/mm/aaaa, por ejemplo 05/11/2026.')
+
+
+# Convierte una fecha guardada en formato ISO al formato día/mes/año.
+def fecha_visible(valor):
+    return date.fromisoformat(valor).strftime('%d/%m/%Y')
+
+
+# Comprueba si el correo tiene una estructura válida antes de guardarlo.
+def correo_valido(valor):
+    return bool(re.fullmatch(r'[A-Z0-9!#$%&*+/=?^_`{|}~-]+(?:\.[A-Z0-9!#$%&*+/=?^_`{|}~-]+)*@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+', valor.upper()))
+
+
+# Solicita el correo hasta que el usuario digite uno con formato válido.
+def pedir_correo():
+    while True:
+        valor = texto('Correo electrónico')
+        if correo_valido(valor):
+            return valor
+        print('Digite un correo válido, por ejemplo USUARIO@EJEMPLO.COM.')
+
+
+# Muestra los datos de un registro con etiquetas o avisa si no existe.
+def mostrar(fila, etiquetas):
+    if fila is None:
+        print('Registro no encontrado.')
+        return
+    for campo, etiqueta in etiquetas:
+        valor = fila[campo]
+        if campo in ('fecha_publicacion', 'fecha_inicio', 'fecha_devolucion'):
+            valor = fecha_visible(valor)
+        print(f'{etiqueta}: {valor}')
+
+
+ETIQUETAS_LIBRO = [('id','Identificador'), ('titulo','Título'), ('autor','Autor'),
+                   ('genero','Género'), ('fecha_publicacion','Fecha de publicación'), ('estado','Estado')]
+ETIQUETAS_USUARIO = [('documento','Documento'), ('nombre','Nombre'), ('apellido','Apellido'),
+                     ('direccion','Dirección'), ('telefono','Teléfono'), ('correo','Correo')]
+
+
+# Solicita los datos de un libro y lo guarda como disponible.
+def registrar_libro(con):
+    datos = (texto('Identificador'), texto('Título'), texto('Autor'), texto('Género'), fecha('Fecha de publicación'))
+    if con.execute('SELECT 1 FROM libros WHERE UPPER(id) = UPPER(?)', (datos[0],)).fetchone():
+        raise ValueError('Ya existe un libro con ese identificador.')
+    con.execute("INSERT INTO libros VALUES (?, ?, ?, ?, ?, 'disponible')", datos)
     con.commit()
-    return con
+    print('Libro registrado como disponible.')
 
 
-class Validacion(unittest.TestCase):
-    def test_texto_obligatorio_mayusculas_y_limite(self):
-        valor, mensaje = probar_entrada(lambda: app.texto('Nombre'), ['', 'a'*121, 'ana pérez'])
-        self.assertEqual(valor, 'ANA PÉREZ')
-        self.assertIn('valor válido', mensaje)
-
-    def test_documento_y_telefono(self):
-        valor, mensaje = probar_entrada(lambda: app.digitos('Documento'), ['abc', '-1', '1.2', '1 2', '1'*31, '00123'])
-        self.assertEqual(valor, '00123')
-        self.assertIn('dígitos', mensaje)
-
-    def test_fecha_formato_y_calendario(self):
-        valor, mensaje = probar_entrada(lambda: app.fecha('Fecha'), ['1/01/2024', '31/02/2024', '29/02/2023', '29/02/2024'])
-        self.assertEqual(valor, '2024-02-29')
-        self.assertIn('dd/mm/aaaa', mensaje)
-        self.assertEqual(app.fecha_visible(valor), '29/02/2024')
-
-    def test_numero_prestamo(self):
-        valor, mensaje = probar_entrada(app.numero_prestamo, ['0', '-1', '1.5', '²', '9223372036854775808', '2'])
-        self.assertEqual(valor, 2)
-        self.assertIn('entero positivo', mensaje)
-
-    def test_correo(self):
-        valor, mensaje = probar_entrada(app.pedir_correo, ['a@b', 'a..b@example.com', 'a@-ejemplo.com', 'ana@example.com'])
-        self.assertEqual(valor, 'ANA@EXAMPLE.COM')
-        self.assertIn('correo válido', mensaje)
+# Muestra el estado del libro y permite cambiarlo o cancelar cuando corresponda.
+def actualizar_estado(con):
+    identificador = texto('Digite el identificador del libro cuyo estado desea modificar')
+    libro = con.execute('SELECT * FROM libros WHERE UPPER(id) = UPPER(?)', (identificador,)).fetchone()
+    if not libro:
+        print('Libro no encontrado.'); return
+    print(f"Estado actual del libro: {libro['estado']}")
+    if libro['estado'] == 'prestado':
+        print('Registre la devolución en el módulo de préstamos para que el libro vuelva a estar disponible.')
+        return
+    nuevo_estado = 'en mantenimiento' if libro['estado'] == 'disponible' else 'disponible'
+    print(f'1. Cambiar a {nuevo_estado}')
+    print('0. Cancelar')
+    while True:
+        opcion = input('Digite 1 para cambiar el estado o 0 para cancelar: ').strip().upper()
+        if opcion in ('0', '1'):
+            break
+        print('Digite 1 para cambiar el estado o 0 para cancelar.')
+    if opcion == '0':
+        print('Cambio cancelado. No se actualizó el estado del libro.')
+        return
+    con.execute('UPDATE libros SET estado = ? WHERE id = ?', (nuevo_estado, libro['id']))
+    con.commit()
+    print('Estado actualizado.')
 
 
-class Flujo(unittest.TestCase):
-    def setUp(self):
-        self.con = base()
+# Busca un libro por identificador y muestra su estado o todos sus datos.
+def consultar_libro(con, solo_estado=False):
+    libro = con.execute('SELECT * FROM libros WHERE UPPER(id) = UPPER(?)', (texto('Digite el identificador del libro que desea consultar'),)).fetchone()
+    mostrar(libro, [('id','Identificador'), ('titulo','Título'), ('estado','Estado')] if solo_estado else ETIQUETAS_LIBRO)
 
-    def tearDown(self):
-        self.con.close()
 
-    def test_cancelar_capturas_vuelve_al_menu_sin_guardar(self):
-        casos = [
-            (app.registrar_prestamo, ['/cancelar']),
-            (app.registrar_prestamo, ['1', '/CANCELAR']),
-            (app.registrar_prestamo, ['1', 'L1', 'fecha incorrecta', '/cancelar']),
-            (app.registrar_libro, ['NUEVO', 'TITULO', '/cancelar']),
-            (app.registrar_usuario, ['3', 'ANA', 'PEREZ', 'CALLE', '123', '/cancelar']),
-            (app.consultar_libro, ['/cancelar']),
-            (app.registrar_devolucion, ['0', '/cancelar']),
-            (app.consultar_prestamos, ['/cancelar']),
-        ]
-        for funcion, datos in casos:
-            with self.subTest(funcion=funcion.__name__, datos=datos):
-                opciones = {'1': ('Operación', lambda: funcion(self.con))}
-                _, salida = probar_entrada(lambda: app.menu(self.con, 'PRUEBA', opciones), ['1'] + datos + ['0'])
-                self.assertIn('Operación cancelada', salida)
-                self.assertEqual(self.con.execute('SELECT count(*) FROM prestamos').fetchone()[0], 0)
-                self.assertEqual(self.con.execute('SELECT count(*) FROM libros').fetchone()[0], 3)
-                self.assertEqual(self.con.execute('SELECT count(*) FROM usuarios').fetchone()[0], 2)
-                self.assertEqual(self.con.execute("SELECT estado FROM libros WHERE id='L1'").fetchone()[0], 'disponible')
+# Muestra hasta 100 libros para ayudar a encontrar sus identificadores.
+def listar_libros(con):
+    """Muestra una muestra de hasta 100 libros para encontrar sus identificadores."""
+    filas = con.execute('SELECT id, titulo, autor, estado FROM libros ORDER BY titulo, id LIMIT 100').fetchall()
+    if not filas:
+        print('No hay libros registrados en el catálogo.')
+        return
+    print('\nMUESTRA DEL CATÁLOGO (máximo 100 libros)')
+    for libro in filas:
+        print(f"Identificador: {libro['id']} | Título: {libro['titulo']} | Autor: {libro['autor']} | Estado: {libro['estado']}")
 
-    def test_cero_sigue_siendo_dato_valido(self):
-        self.assertEqual(probar_entrada(lambda: app.digitos('Documento'), ['0'])[0], '0')
-        self.assertEqual(probar_entrada(lambda: app.texto('Identificador'), ['0'])[0], '0')
 
-    def test_mensajes_de_cancelacion_por_operacion(self):
-        casos = [
-            ('LIBROS', '1', app.registrar_libro, ['/cancelar'], 'No se registró el libro.'),
-            ('LIBROS', '2', app.actualizar_estado, ['/cancelar'], 'No se actualizó el estado del libro.'),
-            ('LIBROS', '3', lambda con: app.consultar_libro(con, True), ['/cancelar'], 'No se consultó la disponibilidad del libro.'),
-            ('LIBROS', '4', app.consultar_libro, ['/cancelar'], 'No se consultaron los datos del libro.'),
-            ('USUARIOS', '1', app.registrar_usuario, ['/cancelar'], 'No se registró el usuario.'),
-            ('USUARIOS', '2', app.actualizar_contacto, ['1', '1', '/cancelar'], 'No se actualizaron los datos de contacto.'),
-            ('USUARIOS', '3', app.consultar_usuario, ['/cancelar'], 'No se consultaron los datos del usuario.'),
-            ('PRÉSTAMOS', '1', app.registrar_prestamo, ['1', 'L1', '/cancelar'], 'No se registró el préstamo.'),
-            ('PRÉSTAMOS', '2', app.registrar_devolucion, ['/cancelar'], 'No se registró la devolución.'),
-            ('PRÉSTAMOS', '3', app.consultar_prestamos, ['/cancelar'], 'No se consultaron los préstamos del usuario.'),
-            ('PRÉSTAMOS', '4', lambda con: app.comprobante(con, app.numero_prestamo()), ['/cancelar'], 'No se generó ni se envió nuevamente el comprobante.'),
-        ]
-        for titulo, opcion, funcion, datos, mensaje in casos:
-            with self.subTest(titulo=titulo, opcion=opcion):
-                opciones = {opcion: ('Operación', lambda: funcion(self.con))}
-                _, salida = probar_entrada(lambda: app.menu(self.con, titulo, opciones), [opcion] + datos + ['0'])
-                self.assertIn(mensaje, salida)
+# Solicita los datos de un usuario y los guarda en la base de datos.
+def registrar_usuario(con):
+    datos = (digitos('Documento'), texto('Nombre'), texto('Apellido'), texto('Dirección'), digitos('Teléfono'), pedir_correo())
+    con.execute('INSERT INTO usuarios VALUES (?, ?, ?, ?, ?, ?)', datos)
+    con.commit()
+    print('Usuario registrado.')
 
-    def test_mensajes_al_cancelar_confirmacion(self):
-        _, salida = probar_entrada(lambda: app.actualizar_estado(self.con), ['L1', '0'])
-        self.assertIn('No se actualizó el estado del libro.', salida)
-        _, salida = probar_entrada(lambda: app.actualizar_contacto(self.con), ['1', '0'])
-        self.assertIn('No se actualizaron los datos de contacto.', salida)
-        numero = app.crear_prestamo(self.con, '1', 'L1', '2026-01-01', '2026-01-02')
-        _, salida = probar_entrada(lambda: app.registrar_devolucion(self.con), [str(numero), '0'])
-        self.assertIn('No se registró la devolución.', salida)
 
-    def test_creacion_consulta_y_actualizacion(self):
-        probar_entrada(lambda: app.registrar_libro(self.con), ['lib4', 'titulo', 'autor', 'género', '01/01/2020'])
-        libro = self.con.execute("SELECT * FROM libros WHERE id='LIB4'").fetchone()
-        self.assertEqual(libro['titulo'], 'TITULO')
-        _, salida = probar_entrada(lambda: app.consultar_libro(self.con), ['lib4'])
-        self.assertIn('TITULO', salida)
-        probar_entrada(lambda: app.actualizar_estado(self.con), ['lib4', 'x', '1'])
-        self.assertEqual(self.con.execute("SELECT estado FROM libros WHERE id='LIB4'").fetchone()[0], 'en mantenimiento')
-        probar_entrada(lambda: app.registrar_usuario(self.con), ['003', 'maria', 'lopez', 'carrera 5', '0123', 'm@example.com'])
-        probar_entrada(lambda: app.actualizar_contacto(self.con), ['003', '1', 'calle 9'])
-        probar_entrada(lambda: app.actualizar_contacto(self.con), ['003', '2', '098'])
-        probar_entrada(lambda: app.actualizar_contacto(self.con), ['003', '3', 'nuevo@example.com'])
-        _, salida = probar_entrada(lambda: app.consultar_usuario(self.con), ['003'])
-        self.assertIn('CALLE 9', salida)
-        self.assertIn('NUEVO@EXAMPLE.COM', salida)
+# Muestra el contacto actual y permite modificar un dato o cancelar.
+def actualizar_contacto(con):
+    documento = digitos('Digite el documento del usuario cuyo contacto desea modificar')
+    usuario = con.execute('SELECT * FROM usuarios WHERE UPPER(documento) = UPPER(?)', (documento,)).fetchone()
+    if not usuario:
+        print('Usuario no encontrado.'); return
+    print(f"Usuario: {usuario['nombre']} {usuario['apellido']} | Documento: {usuario['documento']}")
+    print(f"1. Modificar dirección actual: {usuario['direccion']}")
+    print(f"2. Modificar teléfono actual: {usuario['telefono']}")
+    print(f"3. Modificar correo actual: {usuario['correo']}")
+    print('0. Cancelar')
+    while True:
+        opcion = input('Digite el número del dato que desea modificar o 0 para cancelar: ').strip().upper()
+        if opcion in ('0', '1', '2', '3'):
+            break
+        print('Digite 1, 2, 3 o 0 para cancelar.')
+    if opcion == '0':
+        print('Cambio cancelado. No se actualizaron los datos de contacto.'); return
+    if opcion == '1':
+        con.execute('UPDATE usuarios SET direccion = ? WHERE documento = ?',
+                    (texto('Digite la nueva dirección'), usuario['documento']))
+    elif opcion == '2':
+        con.execute('UPDATE usuarios SET telefono = ? WHERE documento = ?',
+                    (digitos('Digite el nuevo teléfono'), usuario['documento']))
+    else:
+        con.execute('UPDATE usuarios SET correo = ? WHERE documento = ?',
+                    (pedir_correo(), usuario['documento']))
+    con.commit()
+    print('Contacto actualizado.')
 
-    def test_actualizar_estado_muestra_estado_y_transiciones_validas(self):
-        _, salida = probar_entrada(lambda: app.actualizar_estado(self.con), ['L1', '2', '0'])
-        self.assertIn('Estado actual del libro: disponible', salida)
-        self.assertIn('1. Cambiar a en mantenimiento', salida)
-        self.assertIn('Digite 1 para cambiar el estado o 0 para cancelar.', salida)
-        self.assertEqual(self.con.execute("SELECT estado FROM libros WHERE id='L1'").fetchone()[0], 'disponible')
-        _, salida = probar_entrada(lambda: app.actualizar_estado(self.con), ['L3', '1'])
-        self.assertIn('Estado actual del libro: en mantenimiento', salida)
-        self.assertIn('1. Cambiar a disponible', salida)
-        self.assertEqual(self.con.execute("SELECT estado FROM libros WHERE id='L3'").fetchone()[0], 'disponible')
-        app.crear_prestamo(self.con, '1', 'L1', '2026-01-01', '2026-01-10')
-        _, salida = probar_entrada(lambda: app.actualizar_estado(self.con), ['L1'])
-        self.assertIn('Estado actual del libro: prestado', salida)
-        self.assertIn('Registre la devolución', salida)
-        self.assertEqual(self.con.execute("SELECT estado FROM libros WHERE id='L1'").fetchone()[0], 'prestado')
 
-    def test_contacto_muestra_valores_y_permanece_sin_cambios_al_cancelar(self):
-        _, salida = probar_entrada(lambda: app.actualizar_contacto(self.con), ['1', 'X', '0'])
-        for valor in ('CALLE 1', '123', 'ANA@EJEMPLO.COM', 'Digite 1, 2, 3', 'Cambio cancelado'):
-            self.assertIn(valor, salida)
-        usuario = self.con.execute("SELECT * FROM usuarios WHERE documento='1'").fetchone()
-        self.assertEqual((usuario['direccion'], usuario['telefono'], usuario['correo']), ('CALLE 1', '123', 'ANA@EJEMPLO.COM'))
-        probar_entrada(lambda: app.actualizar_contacto(self.con), ['1', '2', '999'])
-        usuario = self.con.execute("SELECT * FROM usuarios WHERE documento='1'").fetchone()
-        self.assertEqual((usuario['direccion'], usuario['telefono'], usuario['correo']), ('CALLE 1', '999', 'ANA@EJEMPLO.COM'))
+# Busca un usuario por su documento y muestra sus datos registrados.
+def consultar_usuario(con):
+    mostrar(con.execute('SELECT * FROM usuarios WHERE UPPER(documento) = UPPER(?)', (digitos('Digite el documento del usuario que desea consultar'),)).fetchone(), ETIQUETAS_USUARIO)
 
-    def test_devolucion_muestra_estado_y_permanece_sin_cambios_al_cancelar(self):
-        numero = app.crear_prestamo(self.con, '1', 'L1', '2020-01-01', '2020-01-02')
-        _, salida = probar_entrada(lambda: app.registrar_devolucion(self.con), [str(numero), 'x', '0'])
-        self.assertIn('Estado actual del préstamo: vencido', salida)
-        self.assertIn('LIBRO UNO', salida)
-        self.assertIn('Devolución cancelada', salida)
-        self.assertEqual(self.con.execute('SELECT devuelto FROM prestamos WHERE numero=?', (numero,)).fetchone()[0], 0)
-        _, salida = probar_entrada(lambda: app.registrar_devolucion(self.con), [str(numero), '1'])
-        self.assertIn('Devolución registrada', salida)
-        _, salida = probar_entrada(lambda: app.registrar_devolucion(self.con), [str(numero)])
-        self.assertIn('Estado actual del préstamo: devuelto', salida)
-        self.assertIn('ya fue devuelto', salida)
 
-    def test_comparaciones_en_mayusculas_y_registro_anterior(self):
-        self.con.execute("INSERT INTO libros VALUES (?, ?, ?, ?, ?, ?)",
-                         ('anterior1', 'ANTERIOR', 'AUTOR', 'GENERO', '2020-01-01', 'disponible'))
-        self.con.commit()
-        _, salida = probar_entrada(lambda: app.consultar_libro(self.con), ['ANTERIOR1'])
-        self.assertIn('ANTERIOR', salida)
-        with self.assertRaises(ValueError):
-            probar_entrada(lambda: app.registrar_libro(self.con),
-                          ['anterior1', 'otro', 'autor', 'genero', '01/01/2020'])
-        n = app.crear_prestamo(self.con, '1', 'ANTERIOR1', '2026-01-01', '2026-01-02')
-        self.assertEqual(app.datos_prestamo(self.con, n)['libro_id'], 'anterior1')
+# Muestra hasta 100 usuarios para ayudar a encontrar sus documentos.
+def listar_usuarios(con):
+    """Muestra hasta 100 usuarios para localizar su número de documento."""
+    filas = con.execute('SELECT documento, nombre, apellido FROM usuarios ORDER BY apellido, nombre, documento LIMIT 100').fetchall()
+    if not filas:
+        print('No hay usuarios registrados.')
+        return
+    print('\nMUESTRA DE USUARIOS (máximo 100 usuarios)')
+    for usuario in filas:
+        print(f"Documento: {usuario['documento']} | Nombre: {usuario['nombre']} {usuario['apellido']}")
 
-    def test_identificadores_con_tildes_y_registros_anteriores(self):
-        self.con.execute('INSERT INTO libros VALUES (?, ?, ?, ?, ?, ?)',
-                         ('café1', 'TÍTULO', 'AUTOR', 'GÉNERO', '2020-01-01', 'disponible'))
-        self.con.commit()
-        for identificador in ('CAFÉ1', 'café1', 'cafe\u03011'):
-            _, salida = probar_entrada(lambda: app.consultar_libro(self.con), [identificador])
-            self.assertIn('TÍTULO', salida)
-        with self.assertRaises(ValueError):
-            probar_entrada(lambda: app.registrar_libro(self.con),
-                           ['CAFÉ1', 'OTRO', 'AUTOR', 'GENERO', '01/01/2020'])
-        numero = app.crear_prestamo(self.con, '1', 'CAFÉ1', '2026-01-01', '2026-01-02')
-        self.assertEqual(app.datos_prestamo(self.con, numero)['libro_id'], 'café1')
-        with contextlib.redirect_stdout(io.StringIO()): app.devolver(self.con, numero)
-        self.assertEqual(self.con.execute('SELECT estado FROM libros WHERE id=?', ('café1',)).fetchone()[0], 'disponible')
-        _, salida = probar_entrada(lambda: app.consultar_libro(self.con), ['CAFE1'])
-        self.assertIn('Registro no encontrado', salida)
 
-    def test_catalogo_vacio_y_con_libros(self):
-        con_vacia = app.conectar(':memory:')
+# Calcula si un préstamo está vigente, vencido o devuelto.
+def estado_prestamo(fila, hoy=None):
+    if fila['devuelto']:
+        return 'devuelto'
+    return 'vencido' if date.fromisoformat(fila['fecha_devolucion']) < (hoy or date.today()) else 'vigente'
+
+
+# Valida el usuario, el libro y las fechas; guarda el préstamo y marca el libro prestado.
+def crear_prestamo(con, documento, libro_id, inicio, devolucion):
+    """Valida y registra préstamo y cambio de estado en una misma transacción."""
+    if date.fromisoformat(devolucion) < date.fromisoformat(inicio):
+        raise ValueError('La fecha de devolución no puede ser anterior a la de inicio.')
+    with con:
+        # Adquirir el bloqueo de escritura antes de comprobar disponibilidad.
+        con.execute('BEGIN IMMEDIATE')
+        usuario = con.execute('SELECT 1 FROM usuarios WHERE UPPER(documento) = UPPER(?)', (documento,)).fetchone()
+        libro = con.execute('SELECT id, estado FROM libros WHERE UPPER(id) = UPPER(?)', (libro_id,)).fetchone()
+        if not usuario:
+            raise ValueError('Usuario no encontrado.')
+        if not libro:
+            raise ValueError('Libro no encontrado.')
+        if libro['estado'] == 'prestado':
+            raise ValueError('El libro está en préstamo.')
+        if libro['estado'] != 'disponible':
+            raise ValueError('El libro está en mantenimiento y no está disponible.')
+        if con.execute('SELECT 1 FROM prestamos WHERE libro_id = ? AND devuelto = 0', (libro['id'],)).fetchone():
+            raise ValueError('El libro está en préstamo.')
+        if con.execute('SELECT 1 FROM prestamos WHERE UPPER(documento) = UPPER(?) AND devuelto = 0', (documento,)).fetchone():
+            raise ValueError('El usuario tiene un préstamo sin devolver.')
+        cursor = con.execute('INSERT INTO prestamos(documento, libro_id, fecha_inicio, fecha_devolucion) VALUES (?, ?, ?, ?)',
+                             (documento, libro['id'], inicio, devolucion))
+        con.execute("UPDATE libros SET estado = 'prestado' WHERE id = ?", (libro['id'],))
+        return cursor.lastrowid
+
+
+# Reúne los datos del préstamo, el usuario y el libro mediante sus relaciones.
+def datos_prestamo(con, numero):
+    return con.execute('''SELECT p.*, u.nombre, u.apellido, u.direccion, u.telefono, u.correo,
+                          l.titulo, l.autor FROM prestamos p
+                          JOIN usuarios u ON u.documento = p.documento
+                          JOIN libros l ON l.id = p.libro_id WHERE p.numero = ?''', (numero,)).fetchone()
+
+
+# Crea y guarda el comprobante PDF con los datos del préstamo.
+def pdf_comprobante(fila):
+    """Construye un PDF de una página con Helvetica, sin dependencias externas."""
+    COMPROBANTES.mkdir(exist_ok=True)
+    lineas = ['COMPROBANTE DE PRESTAMO', '', f"Número de préstamo: {fila['numero']}",
+              f"Usuario: {fila['nombre']} {fila['apellido']}", f"Dirección: {fila['direccion']}",
+              f"Teléfono: {fila['telefono']}", f"Correo: {fila['correo']}", '',
+              f"Título: {fila['titulo']}", f"Autor: {fila['autor']}",
+              f"Fecha de inicio: {fecha_visible(fila['fecha_inicio'])}",
+              f"Fecha de devolución: {fecha_visible(fila['fecha_devolucion'])}", '',
+              f"Estado: {estado_prestamo(fila)}"]
+    # Ajustar líneas largas para evitar que desborden la página.
+    import textwrap
+    lineas = [trozo for linea in lineas for trozo in (textwrap.wrap(linea, width=78, break_long_words=True) or [''])]
+    operaciones = [b'BT /F1 11 Tf 45 800 Td 15 TL']
+    for linea in lineas:
+        contenido = linea.encode('cp1252', 'replace').replace(b'\\', b'\\\\').replace(b'(', b'\\(').replace(b')', b'\\)')
+        operaciones.append(b'(' + contenido + b') Tj T*')
+    operaciones.append(b'ET')
+    flujo = b'\n'.join(operaciones)
+    objetos = [b'<< /Type /Catalog /Pages 2 0 R >>', b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+               b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
+               b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>',
+               b'<< /Length ' + str(len(flujo)).encode() + b' >>\nstream\n' + flujo + b'\nendstream']
+    pdf = bytearray(b'%PDF-1.4\n%\xe2\xe3\xcf\xd3\n')
+    posiciones = [0]
+    for indice, objeto in enumerate(objetos, 1):
+        posiciones.append(len(pdf)); pdf.extend(f'{indice} 0 obj\n'.encode() + objeto + b'\nendobj\n')
+    inicio_xref = len(pdf)
+    pdf.extend(f'xref\n0 {len(posiciones)}\n0000000000 65535 f \n'.encode())
+    for posicion in posiciones[1:]:
+        pdf.extend(f'{posicion:010d} 00000 n \n'.encode())
+    pdf.extend(f'trailer\n<< /Size {len(posiciones)} /Root 1 0 R >>\nstartxref\n{inicio_xref}\n%%EOF\n'.encode())
+    ruta = COMPROBANTES / f'prestamo_{fila["numero"]}.pdf'
+    ruta.write_bytes(pdf)
+    return ruta
+
+
+# Lee la configuración SMTP y envía el PDF adjunto al correo del usuario.
+def enviar_comprobante(fila, ruta):
+    # Una configuración completa en variables de entorno tiene prioridad sobre el archivo local.
+    host = os.environ.get('BIBLIOTECA_SMTP_HOST', '').strip()
+    usuario = os.environ.get('BIBLIOTECA_SMTP_USUARIO', '').strip()
+    clave = os.environ.get('BIBLIOTECA_SMTP_CLAVE', '')
+    if all((host, usuario, clave)):
+        puerto = int(os.environ.get('BIBLIOTECA_SMTP_PUERTO', '587'))
+        remitente = os.environ.get('BIBLIOTECA_SMTP_REMITENTE', usuario).strip()
+    else:
         try:
-            with contextlib.redirect_stdout(io.StringIO()) as salida:
-                app.listar_libros(con_vacia)
-            self.assertIn('No hay libros registrados', salida.getvalue())
-        finally:
-            con_vacia.close()
-        with contextlib.redirect_stdout(io.StringIO()) as salida:
-            app.listar_libros(self.con)
-        texto = salida.getvalue()
-        for dato in ('L1', 'LIBRO UNO', 'AUTOR', 'disponible', 'L3', 'en mantenimiento'):
-            self.assertIn(dato, texto)
+            with CONFIGURACION_CORREO.open(encoding='utf-8') as archivo:
+                configuracion = json.load(archivo)
+            host = configuracion['host'].strip()
+            usuario = configuracion['usuario'].strip()
+            clave = configuracion['clave']
+            remitente = configuracion.get('remitente', '').strip() or usuario
+            puerto = int(configuracion.get('puerto', 587))
+            if not all(isinstance(dato, str) and dato for dato in (host, usuario, clave, remitente)):
+                raise ValueError('Configuración incompleta')
+        except (OSError, KeyError, TypeError, AttributeError, ValueError) as error:
+            raise ValueError('Revise la configuración local del correo según el README.') from error
+    if not 1 <= puerto <= 65535:
+        raise ValueError('Puerto SMTP inválido.')
+    mensaje = EmailMessage()
+    mensaje['Subject'] = f'Comprobante de préstamo {fila["numero"]}'
+    mensaje['From'] = remitente
+    mensaje['To'] = fila['correo']
+    mensaje.set_content('Adjuntamos el comprobante de su préstamo bibliotecario.')
+    mensaje.add_attachment(ruta.read_bytes(), maintype='application', subtype='pdf', filename=ruta.name)
+    contexto = ssl.create_default_context()
+    if puerto == 465:
+        with smtplib.SMTP_SSL(host, puerto, timeout=20, context=contexto) as servidor:
+            servidor.login(usuario, clave); servidor.send_message(mensaje)
+    else:
+        with smtplib.SMTP(host, puerto, timeout=20) as servidor:
+            servidor.ehlo(); servidor.starttls(context=contexto); servidor.ehlo()
+            servidor.login(usuario, clave); servidor.send_message(mensaje)
 
-    def test_catalogo_limitado_a_100(self):
-        self.con.executemany('INSERT INTO libros VALUES (?, ?, ?, ?, ?, ?)',
-            [('X%03d' % i, 'TITULO %03d' % i, 'AUTOR', 'GENERO', '2020-01-01', 'disponible')
-             for i in range(150)])
-        self.con.commit()
-        with contextlib.redirect_stdout(io.StringIO()) as salida:
-            app.listar_libros(self.con)
-        lineas = salida.getvalue().splitlines()
-        self.assertEqual(sum(linea.startswith('Identificador:') for linea in lineas), 100)
-        self.assertIn('máximo 100', salida.getvalue())
-        self.assertNotIn('X149', salida.getvalue())
 
-    def test_muestras_usuarios_y_prestamos(self):
-        vacia = app.conectar(':memory:')
+# Genera el PDF, intenta enviarlo y avisa si ocurre un error.
+def comprobante(con, numero):
+    fila = datos_prestamo(con, numero)
+    if not fila:
+        print('Préstamo no encontrado.'); return
+    try:
+        ruta = pdf_comprobante(fila)
+        print('Comprobante PDF generado:', ruta.name)
+        enviar_comprobante(fila, ruta)
+        print('Comprobante enviado a', fila['correo'])
+    except (OSError, ValueError, smtplib.SMTPException):
+        print('No fue posible generar o enviar el comprobante. Revise la configuración y vuelva a intentarlo.')
+        print('El préstamo se conserva. Puede reintentar el envío del comprobante desde el menú de préstamos.')
+
+
+# Solicita los datos del préstamo, usa la fecha actual y genera el comprobante.
+def registrar_prestamo(con):
+    documento = digitos('Digite el documento del usuario que solicita el préstamo')
+    libro = texto('Digite el identificador del libro que desea prestar')
+    inicio = date.today().isoformat()
+    print('Fecha de inicio del préstamo:', fecha_visible(inicio))
+    while True:
+        devolucion = fecha('Fecha de devolución')
+        if devolucion >= inicio:
+            break
+        print('Digite una fecha de devolución igual o posterior a la fecha de inicio (dd/mm/aaaa).')
+    numero = crear_prestamo(con, documento, libro, inicio, devolucion)
+    print('Préstamo registrado con número', numero)
+    comprobante(con, numero)
+
+
+# Registra la devolución y cambia el estado del libro a disponible.
+def devolver(con, numero):
+    with con:
+        con.execute('BEGIN IMMEDIATE')
+        fila = con.execute('SELECT * FROM prestamos WHERE numero = ?', (numero,)).fetchone()
+        if not fila:
+            raise ValueError('Préstamo no encontrado.')
+        if fila['devuelto']:
+            raise ValueError('El préstamo ya fue devuelto.')
+        con.execute('UPDATE prestamos SET devuelto = 1 WHERE numero = ?', (numero,))
+        con.execute("UPDATE libros SET estado = 'disponible' WHERE id = ?", (fila['libro_id'],))
+    print('Devolución registrada; libro disponible.')
+
+
+# Muestra el préstamo y permite confirmar o cancelar su devolución.
+def registrar_devolucion(con):
+    numero = numero_prestamo('devolver')
+    fila = datos_prestamo(con, numero)
+    if not fila:
+        print('Préstamo no encontrado.'); return
+    estado = estado_prestamo(fila)
+    print(f"Préstamo: {numero} | Usuario: {fila['nombre']} {fila['apellido']} | Libro: {fila['titulo']}")
+    print(f'Estado actual del préstamo: {estado}')
+    if estado == 'devuelto':
+        print('El préstamo ya fue devuelto.'); return
+    print('1. Registrar devolución y marcar el libro disponible')
+    print('0. Cancelar')
+    while True:
+        opcion = input('Digite 1 para registrar la devolución o 0 para cancelar: ').strip().upper()
+        if opcion in ('0', '1'):
+            break
+        print('Digite 1 para registrar la devolución o 0 para cancelar.')
+    if opcion == '0':
+        print('Devolución cancelada. No se registró la devolución.'); return
+    devolver(con, numero)
+
+
+# Solicita el número de préstamo hasta que sea un entero positivo válido.
+def numero_prestamo(operacion='consultar'):
+    while True:
+        valor = texto('Digite el número del préstamo que desea ' + operacion + ' (entero positivo)')
+        # SQLite acepta enteros con signo de hasta 64 bits.
+        if re.fullmatch(r'[0-9]{1,19}', valor) and 0 < int(valor) <= 9223372036854775807:
+            return int(valor)
+        print('Digite un número de préstamo válido: entero positivo hasta 9223372036854775807.')
+
+
+# Muestra el historial de un usuario en páginas de hasta 100 préstamos.
+def consultar_prestamos(con):
+    documento = digitos('Digite el documento del usuario cuyos préstamos desea consultar')
+    if not con.execute('SELECT 1 FROM usuarios WHERE UPPER(documento) = UPPER(?)', (documento,)).fetchone():
+        print('Usuario no encontrado.'); return
+    ultimo_numero = None
+    pagina = 1
+    while True:
+        if ultimo_numero is None:
+            filas = con.execute('''SELECT p.*, l.titulo FROM prestamos p JOIN libros l ON l.id = p.libro_id
+                                   WHERE p.documento = ? ORDER BY p.numero DESC LIMIT 100''', (documento,)).fetchall()
+        else:
+            filas = con.execute('''SELECT p.*, l.titulo FROM prestamos p JOIN libros l ON l.id = p.libro_id
+                                   WHERE p.documento = ? AND p.numero < ? ORDER BY p.numero DESC LIMIT 100''',
+                                (documento, ultimo_numero)).fetchall()
+        if not filas:
+            print('El usuario no tiene préstamos.' if pagina == 1 else 'No hay más préstamos.')
+            return
+        print(f'Página {pagina}: hasta 100 préstamos, más recientes primero.')
+        for fila in filas:
+            print(f"Préstamo {fila['numero']} | {fila['titulo']} ({fila['libro_id']}) | "
+                  f"{fecha_visible(fila['fecha_inicio'])} a {fecha_visible(fila['fecha_devolucion'])} | {estado_prestamo(fila)}")
+        ultimo_numero = filas[-1]['numero']
+        hay_mas = con.execute('SELECT 1 FROM prestamos WHERE documento = ? AND numero < ? LIMIT 1',
+                              (documento, ultimo_numero)).fetchone()
+        if not hay_mas:
+            print('Fin del historial de préstamos.')
+            return
+        print('1. Ver los siguientes préstamos')
+        print('0. Volver al menú')
+        while True:
+            opcion = input('Digite 1 para continuar o 0 para volver: ').strip().upper()
+            if opcion in ('0', '1'):
+                break
+            print('Digite 1 para continuar o 0 para volver.')
+        if opcion == '0':
+            return
+        pagina += 1
+
+
+# Muestra hasta 100 préstamos recientes para encontrar sus números.
+def listar_prestamos(con):
+    """Muestra hasta 100 préstamos recientes, incluidos sus identificadores."""
+    filas = con.execute('''SELECT p.*, l.titulo FROM prestamos p
+                           JOIN libros l ON l.id = p.libro_id
+                           ORDER BY p.numero DESC LIMIT 100''').fetchall()
+    if not filas:
+        print('No hay préstamos registrados.')
+        return
+    print('\nMUESTRA DE PRÉSTAMOS (máximo 100, más recientes primero)')
+    for fila in filas:
+        print(f"Préstamo: {fila['numero']} | Documento: {fila['documento']} | "
+              f"Libro: {fila['libro_id']} - {fila['titulo']} | Estado: {estado_prestamo(fila)}")
+
+
+# Presenta las opciones de un menú y ejecuta la opción elegida.
+def menu(con, titulo, opciones):
+    while True:
+        print('\n' + titulo)
+        for clave, (descripcion, _) in opciones.items():
+            print(f'{clave}. {descripcion}')
+        print('0. Volver' if titulo != 'MENÚ PRINCIPAL' else '0. Salir')
+        opcion = input('Digite el número de la opción: ').strip().upper()
+        if opcion == '0':
+            return
+        if opcion not in opciones:
+            print('Digite una opción válida de las mostradas en el menú.'); continue
         try:
-            with contextlib.redirect_stdout(io.StringIO()) as salida:
-                app.listar_usuarios(vacia)
-                app.listar_prestamos(vacia)
-            self.assertIn('No hay usuarios', salida.getvalue())
-            self.assertIn('No hay préstamos', salida.getvalue())
-        finally:
-            vacia.close()
-        self.con.executemany('INSERT INTO usuarios VALUES (?, ?, ?, ?, ?, ?)',
-                             [(str(i), 'NOMBRE', 'APELLIDO', 'CALLE', '123', 'A@B.CO') for i in range(3, 154)])
-        self.con.executemany('INSERT INTO prestamos(documento, libro_id, fecha_inicio, fecha_devolucion, devuelto) VALUES (?, ?, ?, ?, 1)',
-                             [('1', 'L1', '2020-01-01', '2020-01-02') for _ in range(150)])
-        self.con.commit()
-        for funcion, prefijo in [(app.listar_usuarios, 'Documento:'), (app.listar_prestamos, 'Préstamo:')]:
-            with self.subTest(funcion=funcion.__name__), contextlib.redirect_stdout(io.StringIO()) as salida:
-                funcion(self.con)
-                lineas = salida.getvalue().splitlines()
-                self.assertEqual(sum(linea.startswith(prefijo) for linea in lineas), 100)
-                self.assertIn('máximo 100', salida.getvalue())
-        with contextlib.redirect_stdout(io.StringIO()) as salida:
-            app.listar_prestamos(self.con)
-        self.assertIn('Préstamo: 150 | Documento: 1 | Libro: L1 - LIBRO UNO | Estado: devuelto', salida.getvalue())
-        self.assertNotIn('Préstamo: 1 |', salida.getvalue())
-        _, salida = probar_entrada(lambda: app.consultar_prestamos(self.con), ['1', '0'])
-        self.assertEqual(sum(linea.startswith('Préstamo ') for linea in salida.splitlines()), 100)
-        self.assertIn('Préstamo 150 |', salida)
-        self.assertNotIn('Préstamo 1 |', salida)
-
-    def test_historial_completo_por_paginas(self):
-        self.con.executemany('INSERT INTO prestamos(documento, libro_id, fecha_inicio, fecha_devolucion, devuelto) VALUES (?, ?, ?, ?, 1)',
-                             [('1', 'L1', '2020-01-01', '2020-01-02') for _ in range(201)])
-        self.con.commit()
-        _, salida = probar_entrada(lambda: app.consultar_prestamos(self.con), ['1', 'invalido', '1', '1'])
-        lineas = [linea for linea in salida.splitlines() if linea.startswith('Préstamo ')]
-        self.assertEqual(len(lineas), 201)
-        self.assertEqual(len(set(lineas)), 201)
-        self.assertIn('Préstamo 201 |', lineas[0])
-        self.assertIn('Préstamo 1 |', lineas[-1])
-        self.assertIn('Página 3', salida)
-        self.assertIn('Digite 1 para continuar o 0 para volver.', salida)
-        self.assertIn('Fin del historial', salida)
-
-    def test_historial_vacio_y_pagina_exacta(self):
-        _, salida = probar_entrada(lambda: app.consultar_prestamos(self.con), ['1'])
-        self.assertIn('no tiene préstamos', salida)
-        self.con.executemany('INSERT INTO prestamos(documento, libro_id, fecha_inicio, fecha_devolucion, devuelto) VALUES (?, ?, ?, ?, 1)',
-                             [('1', 'L1', '2020-01-01', '2020-01-02') for _ in range(100)])
-        self.con.commit()
-        _, salida = probar_entrada(lambda: app.consultar_prestamos(self.con), ['1'])
-        self.assertEqual(sum(linea.startswith('Préstamo ') for linea in salida.splitlines()), 100)
-        self.assertIn('Fin del historial', salida)
-
-    def test_inicio_prestamo_es_fecha_actual(self):
-        manana = (datetime.date.today() + datetime.timedelta(days=1)).strftime('%d/%m/%Y')
-        with patch.object(app, 'comprobante') as comprobante:
-            _, salida = probar_entrada(lambda: app.registrar_prestamo(self.con), ['1', 'L1', '01/01/1900', manana])
-        fila = self.con.execute('SELECT * FROM prestamos').fetchone()
-        self.assertEqual(fila['fecha_inicio'], datetime.date.today().isoformat())
-        self.assertIn('Fecha de inicio del préstamo:', salida)
-        self.assertIn('igual o posterior', salida)
-        comprobante.assert_called_once()
-
-    def test_prestamos_sin_indices_adicionales(self):
-        indices = self.con.execute("SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL").fetchall()
-        self.assertEqual(indices, [])
-        self.con.execute("INSERT INTO prestamos(documento, libro_id, fecha_inicio, fecha_devolucion) VALUES (?, ?, ?, ?)",
-                         ('1', 'L1', '2026-01-01', '2026-01-02'))
-        self.con.commit()
-        # Aun si el estado del libro fue alterado fuera del programa, no se presta dos veces.
-        with self.assertRaisesRegex(ValueError, 'libro está en préstamo'):
-            app.crear_prestamo(self.con, '2', 'L1', '2026-01-01', '2026-01-02')
-        with self.assertRaisesRegex(ValueError, 'usuario tiene un préstamo'):
-            app.crear_prestamo(self.con, '1', 'L2', '2026-01-01', '2026-01-02')
-
-    def test_restricciones_prestamo_y_devolucion(self):
-        n = app.crear_prestamo(self.con, '1', 'L1', '2026-01-01', '2026-01-10')
-        fila = app.datos_prestamo(self.con, n)
-        self.assertEqual(app.estado_prestamo(fila, datetime.date(2026, 1, 10)), 'vigente')
-        self.assertEqual(app.estado_prestamo(fila, datetime.date(2026, 1, 11)), 'vencido')
-        for usuario, libro in [('1', 'L2'), ('2', 'L1'), ('2', 'L3'), ('9', 'L2'), ('2', 'NO')]:
-            with self.subTest(usuario=usuario, libro=libro), self.assertRaises(ValueError):
-                app.crear_prestamo(self.con, usuario, libro, '2026-01-01', '2026-01-10')
-        with self.assertRaises(ValueError):
-            app.crear_prestamo(self.con, '2', 'L2', '2026-01-10', '2026-01-01')
-        self.assertEqual(self.con.execute('SELECT count(*) FROM prestamos').fetchone()[0], 1)
-        with contextlib.redirect_stdout(io.StringIO()): app.devolver(self.con, n)
-        self.assertEqual(app.estado_prestamo(app.datos_prestamo(self.con, n)), 'devuelto')
-        self.assertEqual(self.con.execute("SELECT estado FROM libros WHERE id='L1'").fetchone()[0], 'disponible')
-        with self.assertRaises(ValueError): app.devolver(self.con, n)
-        self.assertIsNotNone(app.crear_prestamo(self.con, '1', 'L2', '2026-01-01', '2026-01-10'))
-
-    def test_claves_foraneas_y_sql_injection(self):
-        with self.assertRaises(sqlite3.IntegrityError):
-            self.con.execute("INSERT INTO prestamos(documento,libro_id,fecha_inicio,fecha_devolucion) VALUES (?, ?, ?, ?)", ('9', 'L1', '2026-01-01', '2026-01-02'))
-        self.con.rollback()
-        _, salida = probar_entrada(lambda: app.consultar_libro(self.con), ["L1' OR '1'='1"])
-        self.assertIn('no encontrado', salida)
-        self.assertEqual(self.con.execute('SELECT count(*) FROM libros').fetchone()[0], 3)
-
-    def test_duplicados_y_recuperacion_menu(self):
-        entradas = ['1', '1', 'otro', 'autor', 'calle', '123', 'a@b.co', '1', '3', 'nuevo', 'usuario', 'calle', '123', 'a@b.co', '0']
-        opciones = {'1': ('Registrar', lambda: app.registrar_usuario(self.con))}
-        _, salida = probar_entrada(lambda: app.menu(self.con, 'USUARIOS', opciones), entradas)
-        self.assertIn('duplicado', salida)
-        self.assertIsNotNone(self.con.execute("SELECT 1 FROM usuarios WHERE documento='3'").fetchone())
-
-    def test_pdf_y_envio_simulado(self):
-        n = app.crear_prestamo(self.con, '1', 'L1', '2026-01-01', '2026-01-10')
-        fila = app.datos_prestamo(self.con, n)
-        with tempfile.TemporaryDirectory() as tmp, patch.object(app, 'COMPROBANTES', Path(tmp)):
-            pdf = app.pdf_comprobante(fila)
-            contenido = pdf.read_bytes()
-            for valor in (b'%PDF-1.4', b'ANA', b'LIBRO UNO', b'01/01/2026', b'10/01/2026', b'%%EOF'):
-                self.assertIn(valor, contenido)
-            config = {'BIBLIOTECA_SMTP_HOST':'smtp.example.com', 'BIBLIOTECA_SMTP_USUARIO':'test@example.com', 'BIBLIOTECA_SMTP_CLAVE':'prueba', 'BIBLIOTECA_SMTP_PUERTO':'587'}
-            with patch.dict(os.environ, config, clear=True), patch.object(app.smtplib, 'SMTP') as smtp:
-                app.enviar_comprobante(fila, pdf)
-                conexion = smtp.return_value.__enter__.return_value
-                conexion.starttls.assert_called_once()
-                correo = conexion.send_message.call_args.args[0]
-                self.assertEqual(correo['To'], 'ANA@EJEMPLO.COM')
-                self.assertEqual(next(correo.iter_attachments()).get_payload(decode=True), contenido)
-
-    def test_configuracion_local_persistente_y_precedencia_entorno(self):
-        n = app.crear_prestamo(self.con, '1', 'L1', '2026-01-01', '2026-01-10')
-        fila = app.datos_prestamo(self.con, n)
-        with tempfile.TemporaryDirectory() as tmp, patch.object(app, 'COMPROBANTES', Path(tmp)):
-            ruta = app.pdf_comprobante(fila)
-            archivo = Path(tmp) / 'configuracion_correo.json'
-            archivo.write_text(json.dumps({'host': 'smtp.example.com', 'puerto': 587,
-                                            'usuario': 'cuenta@example.com', 'clave': 'clave-ficticia'}), encoding='utf-8')
-            with patch.object(app, 'CONFIGURACION_CORREO', archivo), patch.dict(os.environ, {}, clear=True), patch.object(app.smtplib, 'SMTP') as smtp:
-                app.enviar_comprobante(fila, ruta)
-                smtp.assert_called_once_with('smtp.example.com', 587, timeout=20)
-                smtp.return_value.__enter__.return_value.login.assert_called_once_with('cuenta@example.com', 'clave-ficticia')
-            entorno = {'BIBLIOTECA_SMTP_HOST': 'otro.example.com', 'BIBLIOTECA_SMTP_USUARIO': 'otro@example.com', 'BIBLIOTECA_SMTP_CLAVE': 'otra-clave'}
-            with patch.object(app, 'CONFIGURACION_CORREO', archivo), patch.dict(os.environ, entorno, clear=True), patch.object(app.smtplib, 'SMTP') as smtp:
-                app.enviar_comprobante(fila, ruta)
-                smtp.assert_called_once_with('otro.example.com', 587, timeout=20)
-            archivo.write_text('{invalido', encoding='utf-8')
-            with patch.object(app, 'CONFIGURACION_CORREO', archivo), patch.dict(os.environ, {}, clear=True):
-                with self.assertRaises(ValueError): app.enviar_comprobante(fila, ruta)
-
-    def test_fallo_de_correo_conserva_prestamo(self):
-        n = app.crear_prestamo(self.con, '1', 'L1', '2026-01-01', '2026-01-10')
-        with tempfile.TemporaryDirectory() as tmp, patch.object(app, 'COMPROBANTES', Path(tmp)), patch.dict(os.environ, {}, clear=True):
-            with contextlib.redirect_stdout(io.StringIO()) as salida: app.comprobante(self.con, n)
-            self.assertIn('préstamo se conserva', salida.getvalue())
-            self.assertTrue((Path(tmp) / ('prestamo_%s.pdf' % n)).exists())
-            self.assertEqual(self.con.execute("SELECT estado FROM libros WHERE id='L1'").fetchone()[0], 'prestado')
+            opciones[opcion][1]()
+        except InterruptedError as error:
+            if error.args != ('cancelacion_solicitada',):
+                raise
+            con.rollback()
+            mensajes = {
+                ('LIBROS', '1'): 'No se registró el libro.',
+                ('LIBROS', '2'): 'No se actualizó el estado del libro.',
+                ('LIBROS', '3'): 'No se consultó la disponibilidad del libro.',
+                ('LIBROS', '4'): 'No se consultaron los datos del libro.',
+                ('USUARIOS', '1'): 'No se registró el usuario.',
+                ('USUARIOS', '2'): 'No se actualizaron los datos de contacto.',
+                ('USUARIOS', '3'): 'No se consultaron los datos del usuario.',
+                ('PRÉSTAMOS', '1'): 'No se registró el préstamo.',
+                ('PRÉSTAMOS', '2'): 'No se registró la devolución.',
+                ('PRÉSTAMOS', '3'): 'No se consultaron los préstamos del usuario.',
+                ('PRÉSTAMOS', '4'): 'No se generó ni se envió nuevamente el comprobante.',
+            }
+            print('Operación cancelada.', mensajes.get((titulo, opcion), 'No se completó la operación.'))
+        except sqlite3.IntegrityError:
+            con.rollback()
+            print('No se pudo guardar: identificador duplicado o datos incompatibles.')
+        except ValueError as error:
+            con.rollback()
+            print('No se pudo completar la operación:', error)
+        except sqlite3.Error:
+            con.rollback()
+            print('No se pudo acceder a la base de datos. Intente nuevamente.')
 
 
-class Ejecucion(unittest.TestCase):
-    def test_ejecucion_completa_por_consola(self):
-        # Se ejecuta en un directorio temporal; nunca usa la base real del proyecto.
-        entradas = '\n'.join(['error', '1', '1', 'L1', 'Libro', 'Autor', 'Ciencia',
-                              '31/02/2026', '01/01/2020', '0', '2', '1', 'abc', '123',
-                              'Ana', 'Perez', 'Calle 1', '123', 'ana@example.com', '0',
-                              '3', '1', '123', 'L1', '01/01/1900',
-                              (datetime.date.today() + datetime.timedelta(days=1)).strftime('%d/%m/%Y'), '3', '123', '2', 'a', '1', '1', '0', '0', ''])
-        with tempfile.TemporaryDirectory() as tmp:
-            copia = Path(tmp) / 'aplicacion.py'
-            copia.write_text(ARCHIVO.read_text(encoding='utf-8'), encoding='utf-8')
-            entorno = {k: v for k, v in os.environ.items() if not k.startswith('BIBLIOTECA_SMTP_')}
-            resultado = subprocess.run([sys.executable, str(copia)], input=entradas,
-                                       text=True, cwd=tmp, env=entorno,
-                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
-            self.assertEqual(resultado.returncode, 0, resultado.stderr)
-            for mensaje in ('opción válida', 'fecha válida', 'igual o posterior',
-                            'Préstamo registrado', 'Devolución registrada'):
-                self.assertIn(mensaje, resultado.stdout)
-            with sqlite3.connect(str(Path(tmp) / 'BaseDeDatosAplicacion.db')) as con:
-                self.assertEqual(con.execute('SELECT titulo, estado FROM libros').fetchone(), ('LIBRO', 'disponible'))
-                self.assertEqual(con.execute('SELECT devuelto FROM prestamos').fetchone()[0], 1)
+# Conecta la base de datos, organiza los menús y cierra la conexión al salir.
+def main():
+    con = conectar()
+    try:
+        libros = {'1': ('Registrar libro', lambda: registrar_libro(con)),
+                  '2': ('Actualizar estado', lambda: actualizar_estado(con)),
+                  '3': ('Consultar disponibilidad', lambda: consultar_libro(con, True)),
+                  '4': ('Consultar datos', lambda: consultar_libro(con)),
+                  '5': ('Consultar muestra del catálogo (hasta 100 libros)', lambda: listar_libros(con))}
+        usuarios = {'1': ('Crear usuario', lambda: registrar_usuario(con)),
+                    '2': ('Actualizar contacto', lambda: actualizar_contacto(con)),
+                    '3': ('Consultar usuario', lambda: consultar_usuario(con)),
+                    '4': ('Consultar muestra de usuarios (hasta 100)', lambda: listar_usuarios(con))}
+        prestamos = {'1': ('Registrar préstamo', lambda: registrar_prestamo(con)),
+                     '2': ('Registrar devolución', lambda: registrar_devolucion(con)),
+                     '3': ('Consultar préstamos de usuario', lambda: consultar_prestamos(con)),
+                     '4': ('Generar y enviar comprobante nuevamente', lambda: comprobante(con, numero_prestamo('generar y enviar nuevamente'))),
+                     '5': ('Consultar muestra de préstamos (hasta 100)', lambda: listar_prestamos(con))}
+        menu(con, 'MENÚ PRINCIPAL', {'1': ('Libros', lambda: menu(con, 'LIBROS', libros)),
+                                     '2': ('Usuarios', lambda: menu(con, 'USUARIOS', usuarios)),
+                                     '3': ('Préstamos', lambda: menu(con, 'PRÉSTAMOS', prestamos))})
+    except (EOFError, KeyboardInterrupt):
+        print('\nPrograma finalizado.')
+    finally:
+        con.close()
 
 
 if __name__ == '__main__':
-    unittest.main()
+    main()
