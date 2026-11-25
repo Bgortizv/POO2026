@@ -9,6 +9,7 @@ import re
 import sqlite3
 import smtplib
 import ssl
+import unicodedata
 from datetime import date, datetime
 from email.message import EmailMessage
 from pathlib import Path
@@ -19,9 +20,18 @@ COMPROBANTES = CARPETA / 'comprobantes'
 CONFIGURACION_CORREO = CARPETA / 'configuracion_correo.json'
 
 
+def mayusculas(valor):
+    """Normaliza tildes equivalentes y convierte letras Unicode a mayúsculas."""
+    if valor is None:
+        return None
+    return unicodedata.normalize('NFC', unicodedata.normalize('NFC', valor).upper())
+
+
 def conectar(ruta=BASE_DATOS):
     conexion = sqlite3.connect(str(ruta))
     conexion.row_factory = sqlite3.Row
+    # UPPER de SQLite solo reconoce ASCII; se utiliza el upper Unicode de Python.
+    conexion.create_function('UPPER', 1, mayusculas)
     conexion.execute('PRAGMA foreign_keys = ON')
     conexion.executescript('''
     CREATE TABLE IF NOT EXISTS libros (
@@ -48,7 +58,7 @@ def conectar(ruta=BASE_DATOS):
 def texto(etiqueta):
     while True:
         valor = input(etiqueta + ': ').strip()
-        valor = valor.upper()
+        valor = mayusculas(valor)
         if valor and len(valor) <= 120 and all(c.isprintable() for c in valor):
             return valor
         print('Digite un valor válido de 1 a 120 caracteres imprimibles.')
@@ -234,7 +244,7 @@ def crear_prestamo(con, documento, libro_id, inicio, devolucion):
             raise ValueError('El usuario tiene un préstamo sin devolver.')
         cursor = con.execute('INSERT INTO prestamos(documento, libro_id, fecha_inicio, fecha_devolucion) VALUES (?, ?, ?, ?)',
                              (documento, libro['id'], inicio, devolucion))
-        con.execute("UPDATE libros SET estado = 'prestado' WHERE UPPER(id) = UPPER(?)", (libro_id,))
+        con.execute("UPDATE libros SET estado = 'prestado' WHERE id = ?", (libro['id'],))
         return cursor.lastrowid
 
 
@@ -359,7 +369,7 @@ def devolver(con, numero):
         if fila['devuelto']:
             raise ValueError('El préstamo ya fue devuelto.')
         con.execute('UPDATE prestamos SET devuelto = 1 WHERE numero = ?', (numero,))
-        con.execute("UPDATE libros SET estado = 'disponible' WHERE UPPER(id) = UPPER(?)", (fila['libro_id'],))
+        con.execute("UPDATE libros SET estado = 'disponible' WHERE id = ?", (fila['libro_id'],))
     print('Devolución registrada; libro disponible.')
 
 
