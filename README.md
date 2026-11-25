@@ -1,101 +1,688 @@
-# Proyecto de biblioteca — entrega 1
+# Sistema de gestión de biblioteca
 
-Aplicación de consola para administrar libros, usuarios y préstamos. Se implementa con funciones y tipos básicos, sin clases propias ni interfaz gráfica, siguiendo la estrategia de persistencia SQLite del archivo `ejemplo1.py`. Requiere Python 3.9 o posterior; no necesita instalar paquetes.
+## 1. Descripción general
 
-## Ejecución
+Este programa es una aplicación de consola para administrar una
+biblioteca. Permite registrar y consultar usuarios, registrar libros,
+actualizar su estado y gestionar los préstamos y las devoluciones.
 
-Abra IDLE con `POO2026/proyecto_entrega_1` como directorio de trabajo, abra `proyecto_entrega_1.py` y seleccione **Run > Run Module** (F5). También puede ejecutarlo desde una terminal situada en `POO2026/proyecto_entrega_1`:
+El sistema utiliza una base de datos SQLite almacenada localmente en el
+archivo `ParcialDos.db`. Al iniciar, establece la conexión y crea las
+tablas necesarias si todavía no existen.
 
-```sh
-python3 proyecto_entrega_1.py
+Las funciones principales se organizan en tres módulos:
+
+-   **Usuarios:** registro de usuarios, actualización de sus datos de
+    contacto y consulta de su información.
+-   **Libros:** registro de libros, actualización de su estado y
+    consulta de disponibilidad o información general.
+-   **Préstamos:** registro de préstamos, registro de devoluciones y
+    consulta del historial de préstamos de un usuario.
+
+Al registrar un préstamo, el sistema comprueba que el usuario exista,
+que no tenga otro préstamo vigente y que el libro esté disponible. La
+fecha de devolución prevista se calcula a siete días de la fecha de
+inicio. Después de registrar el préstamo, se genera un comprobante PDF y
+se intenta enviarlo al correo electrónico del usuario.
+
+El comprobante se guarda en la carpeta `comprobantes`, que se crea
+automáticamente si no existe.
+
+## 2. Requerimientos del programa
+
+### 2.1. Requerimientos de software
+
+-   Python **3.9.10**.
+-   SQLite, mediante el módulo `sqlite3` incluido en la biblioteca
+    estándar de Python.
+-   Módulos de biblioteca estándar:
+    -   `re`: validación de datos mediante expresiones regulares.
+    -   `os`: operaciones del sistema, como limpiar o pausar la consola
+        y crear carpetas.
+    -   `datetime`: manejo de fechas.
+    -   `smtplib`: conexión y envío de mensajes por SMTP.
+    -   `email.message`: construcción del mensaje de correo.
+-   ReportLab **4.2.5**, para generar los comprobantes PDF.
+
+### 2.2. Instalación
+
+1.  Instalar Python 3.9.10.
+
+2.  Abrir una terminal en la carpeta del proyecto.
+
+3.  Instalar la versión requerida de ReportLab:
+
+    ``` bash
+    python -m pip install "reportlab==4.2.5"
+    ```
+
+No es necesario instalar SQLite ni los demás módulos mencionados, ya que
+forman parte de la biblioteca estándar de Python.
+
+### 2.3. Ejecución
+
+Desde la terminal, ubicarse en la carpeta que contiene el archivo del
+programa y ejecutar:
+
+``` bash
+python parcial2.py
 ```
 
-El programa utiliza `BaseDeDatosAplicacion.db`, la base de datos de la carpeta `POO2026/proyecto_entrega_1`. Ejecuta el programa con `POO2026/proyecto_entrega_1` como directorio de trabajo: SQLite busca el nombre de la base de datos en ese directorio. Si se ejecuta desde otro directorio, SQLite puede crear allí otra base con el mismo nombre. Los comprobantes se guardan en la carpeta `comprobantes/` junto al programa. No se borran las tablas existentes; se crean las tablas del proyecto si aún no existen.
+El nombre del comando debe ajustarse al nombre real con el que se haya
+guardado el archivo.
 
-## Manual de usuario y casos de uso
+En el primer inicio se crea automáticamente `ParcialDos.db` y se generan
+las tablas que no existan. En ejecuciones posteriores se utiliza la
+misma base de datos, conservando los registros almacenados.
 
-El menú principal contiene Libros, Usuarios y Préstamos; 0 regresa o termina. Todos los datos son obligatorios y las fechas se introducen como `dd/mm/aaaa`.
+El programa utiliza comandos de consola como `cls` y `pause`, pensados
+para Windows.
 
-1. **Registrar libro:** en Libros, opción 1, digite identificador único, título, autor, género y fecha de publicación. El libro inicia disponible. Las opciones 3 y 4 consultan disponibilidad o todos sus datos por identificador. Si no conoce el identificador, use la opción 5 para consultar una muestra del catálogo: muestra el identificador, título, autor y estado de hasta 100 libros, ordenados por título e identificador. No muestra necesariamente todos los libros registrados.
-2. **Actualizar estado:** en Libros, opción 2, ingrese el identificador. Se muestra el estado actual y, si está disponible o en mantenimiento, se ofrece cambiar al otro estado con 1 o cancelar con 0. Si está prestado, se indica que debe registrarse la devolución en el módulo de préstamos.
-3. **Registrar usuario:** en Usuarios, opción 1, ingrese documento único, nombre, apellido, dirección, teléfono y correo. La opción 2 muestra los datos de contacto actuales y permite elegir uno para modificarlo o cancelar; repita la operación si desea modificar otro. La 3 consulta el registro vigente. La opción 4 muestra hasta 100 usuarios con documento y nombre, ordenados por apellido, nombre y documento.
-4. **Registrar préstamo:** registre primero el usuario y el libro. En Préstamos, opción 1, indique documento, identificador del libro y fechas de inicio y devolución. La devolución no puede ser anterior al inicio. El programa asigna un número, marca el libro prestado, crea el PDF e intenta enviarlo al correo registrado. Un usuario con cualquier préstamo sin devolver, incluso vencido, no puede recibir otro; el libro debe estar disponible.
-5. **Registrar devolución:** en Préstamos, opción 2, ingrese el número del préstamo. Se muestran el usuario, el libro y el estado actual; seleccione 1 para confirmar la devolución o 0 para cancelar. Al confirmar, el estado pasa a devuelto y el libro a disponible. Una devolución no puede registrarse dos veces.
-6. **Consultar préstamos:** en Préstamos, opción 3, ingrese el documento para consultar todo el historial y sus estados, ordenados del más reciente al más antiguo. Cada página muestra hasta 100 préstamos; digite 1 para ver la siguiente o 0 para volver. Un préstamo sin devolver está vencido desde el día posterior a la fecha de devolución; el día de devolución sigue vigente.
-7. **Reintentar comprobante:** en Préstamos, opción 4, ingrese el número para generar nuevamente el PDF con los datos actuales y volver a intentar su envío. Esto también permite obtener el comprobante después de registrar una devolución. La opción 5 muestra hasta 100 préstamos más recientes con número, documento, libro y estado para encontrar sus identificadores.
+### 2.4. Configuración y prueba del correo
 
-Si falla la generación o el envío, el préstamo permanece guardado y se muestra un aviso; si el PDF se generó antes del fallo, también permanece guardado. La generación y el envío del comprobante no deshacen un préstamo ya registrado.
+La función de comprobantes utiliza SMTP con una cuenta de prueba de
+Ethereal Email. Este servicio permite inspeccionar los mensajes de
+prueba, pero **no entrega los correos al destinatario real**.
 
-## Configuración del correo
+Para revisar un mensaje enviado por la aplicación, se puede ingresar en
+<https://ethereal.email/> con las credenciales de prueba incluidas en el
+código fuente. Las credenciales deben tratarse como datos de
+configuración de prueba y no reutilizarse en un entorno real.
 
-Antes de abrir Python o IDLE, configure las variables de entorno de una cuenta SMTP autorizada. Por ejemplo, en macOS o Linux:
+Para utilizar un servidor SMTP real, deben reemplazarse los parámetros
+`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER` y `SMTP_PASSWORD` dentro de
+`generar_comprobante_prestamo()`, de acuerdo con los datos suministrados
+por el proveedor de correo. También debe verificarse la configuración de
+seguridad y autenticación exigida por dicho servidor.
 
-```sh
-export BIBLIOTECA_SMTP_HOST='smtp.ejemplo.com'
-export BIBLIOTECA_SMTP_PUERTO='587'
-export BIBLIOTECA_SMTP_USUARIO='usuario@ejemplo.com'
-export BIBLIOTECA_SMTP_CLAVE='contraseña_o_clave_de_aplicacion'
-export BIBLIOTECA_SMTP_REMITENTE='usuario@ejemplo.com'
-python3 proyecto_entrega_1/proyecto_entrega_1.py
+## 3. Diseño lógico: estructura de la base de datos
+
+La base de datos se denomina `ParcialDos.db` y está compuesta por tres
+tablas: `usuarios`, `libros` y `prestamos`.
+
+### 3.1. Tabla `usuarios`
+
+Almacena los datos de identificación y contacto de cada usuario.
+
+  ------------------------------------------------------------------------
+  Campo              Tipo              Restricción       Descripción
+  ------------------ ----------------- ----------------- -----------------
+  `identificacion`   TEXT              Clave primaria,   Número de
+                                       NOT NULL          identificación
+                                                         del usuario.
+
+  `nombres`          TEXT              NOT NULL          Nombres del
+                                                         usuario.
+
+  `apellidos`        TEXT              NOT NULL          Apellidos del
+                                                         usuario.
+
+  `direccion`        TEXT              NOT NULL          Dirección de
+                                                         residencia.
+
+  `telefono`         TEXT              NOT NULL          Número de
+                                                         contacto.
+
+  `email`            TEXT              NOT NULL          Correo
+                                                         electrónico.
+  ------------------------------------------------------------------------
+
+La identificación es única y se utiliza para relacionar al usuario con
+sus préstamos.
+
+### 3.2. Tabla `libros`
+
+Almacena la información bibliográfica y el estado de cada libro.
+
+  --------------------------------------------------------------------------
+  Campo                Tipo              Restricción       Descripción
+  -------------------- ----------------- ----------------- -----------------
+  `identificador`      ---               Clave primaria,   Código único del
+                                         NOT NULL          libro.
+
+  `titulo`             TEXT              NOT NULL          Título del libro.
+
+  `autor`              TEXT              NOT NULL          Autor del libro.
+
+  `genero`             TEXT              NOT NULL          Género literario.
+
+  `fechaPublicacion`   DATE              NOT NULL          Fecha de
+                                                           publicación.
+
+  `estado`             TEXT              NOT NULL          Estado actual del
+                                                           libro.
+  --------------------------------------------------------------------------
+
+Los estados que maneja la aplicación son `Disponible`, `Prestado` y
+`En mantenimiento`. Al registrar un libro nuevo, su estado inicial es
+`Disponible`.
+
+### 3.3. Tabla `prestamos`
+
+Registra cada operación de préstamo y su estado.
+
+  -------------------------------------------------------------------------------
+  Campo                     Tipo              Restricción       Descripción
+  ------------------------- ----------------- ----------------- -----------------
+  `id`                      INTEGER           Clave primaria,   Identificador
+                                              AUTOINCREMENT     único del
+                                                                préstamo.
+
+  `identificacionUsuario`   TEXT              NOT NULL, clave   Identificación
+                                              foránea           del usuario que
+                                                                recibe el libro.
+
+  `identificacionLibro`     TEXT              NOT NULL, clave   Identificador del
+                                              foránea           libro prestado.
+
+  `fechaInicio`             DATE              NOT NULL          Fecha de inicio
+                                                                del préstamo.
+
+  `fechaDevolucion`         DATE              Puede ser NULL    Fecha de
+                                              según la          devolución
+                                              definición        registrada o
+                                                                prevista.
+
+  `estado`                  TEXT              NOT NULL          Estado del
+                                                                préstamo:
+                                                                `vigente` o
+                                                                `devuelto`.
+  -------------------------------------------------------------------------------
+
+Las claves foráneas relacionan `prestamos.identificacionUsuario` con
+`usuarios.identificacion` y `prestamos.identificacionLibro` con
+`libros.identificador`. En la definición se especifican las acciones
+`ON UPDATE CASCADE` y `ON DELETE CASCADE`.
+
+### 3.4. Relaciones entre tablas
+
+-   **Usuarios 1:N Préstamos:** un usuario puede tener varios préstamos
+    registrados a lo largo del tiempo; cada préstamo pertenece a un
+    usuario.
+-   **Libros 1:N Préstamos:** un libro puede aparecer en distintos
+    préstamos a lo largo del tiempo; cada préstamo corresponde a un
+    libro.
+-   **Préstamos:** funciona como tabla de relación entre usuarios y
+    libros y conserva el historial de las operaciones.
+
+Representación simplificada:
+
+``` text
+USUARIOS                         LIBROS
+----------------------           ----------------------
+PK identificacion                PK identificador
+   nombres                          titulo
+   apellidos                        autor
+   direccion                        genero
+   telefono                         fechaPublicacion
+   email                            estado
+       |                                |
+       | 1                              | 1
+       |                                |
+       +---------- N PRESTAMOS N -------+
+                  ----------------------
+                  PK id
+                  FK identificacionUsuario
+                  FK identificacionLibro
+                     fechaInicio
+                     fechaDevolucion
+                     estado
 ```
 
-El puerto predeterminado es 587 y usa STARTTLS; el 465 usa SSL. El remitente es opcional y por defecto es el usuario SMTP. Algunos proveedores exigen una contraseña de aplicación. No incluya credenciales en el código ni comparta la base de datos y los comprobantes sin protegerlos: contienen datos personales. Para IDLE, inícielo desde el mismo entorno que tenga estas variables. Sin configuración o conexión SMTP se genera el PDF, pero no se envía; configure el servicio y use la opción de reintento.
+**Observación sobre las fechas:** aunque las columnas están declaradas
+como `DATE`, las funciones de préstamo guardan las fechas como cadenas
+con formato `DD/MM/AAAA`. SQLite permite almacenar estos valores, pues 
+las guarda en realidad como texto plano.
 
-## Relación entre opciones y especificación
+## 4. Casos de uso
 
-| Menú y opción | Relación con `Proyecto.docx` |
-| --- | --- |
-| Libros 1: Registrar libro | Solicitada expresamente: registrar un nuevo libro. |
-| Libros 2: Actualizar estado | Solicitada expresamente. Mostrar el estado actual, ofrecer el cambio pertinente y permitir cancelar son decisiones de interacción. La asignación automática de prestado se explica más abajo. |
-| Libros 3: Consultar disponibilidad | Solicitada expresamente. |
-| Libros 4: Consultar datos | Solicitada expresamente: consultar datos vigentes del libro. |
-| Libros 5: Muestra del catálogo | Función de apoyo acordada para encontrar identificadores; el documento no la exige ni define la forma de descubrirlos. |
-| Usuarios 1: Crear usuario | Solicitada expresamente. |
-| Usuarios 2: Actualizar contacto | Solicitada expresamente. Mostrar los datos actuales, modificar un campo a la vez y cancelar son decisiones de interacción. |
-| Usuarios 3: Consultar usuario | Solicitada expresamente: consultar información vigente. |
-| Usuarios 4: Muestra de usuarios | Función de apoyo acordada para encontrar documentos; el documento no la exige. |
-| Préstamos 1: Registrar préstamo | Solicitada expresamente; incluye la generación y el intento de envío del comprobante exigido. |
-| Préstamos 2: Registrar devolución | Solicitada expresamente. Mostrar el estado y permitir confirmar o cancelar son decisiones de interacción. |
-| Préstamos 3: Consultar préstamos de usuario | Solicitada expresamente para conocer el estado de sus préstamos. El historial completo se consulta en páginas de hasta 100 préstamos. |
-| Préstamos 4: Generar y enviar nuevamente | Función de apoyo para reintentar el comprobante cuando se requiera; el enunciado exige generarlo y enviarlo, pero no describe el reintento. |
-| Préstamos 5: Muestra de préstamos | Función de apoyo acordada para encontrar números de préstamo; el documento no la exige. |
-| Opción 0: Volver, salir o cancelar | Navegación y control de la operación; el documento exige menús, pero no prescribe sus opciones de salida. |
+Los siguientes casos corresponden a las opciones funcionales de los
+submenús. Se excluyen las opciones para volver al menú principal y salir
+del programa.
 
-Las muestras de los tres módulos tienen un límite de 100 acordado para evitar cargar todos los registros; no permiten recorrer los registros restantes. La decisión de tratar como impedimento cualquier préstamo sin devolver, incluido uno vencido, es más restrictiva que la frase del enunciado «No se prestan libros a usuarios con préstamos vigentes»: el documento no especifica qué hacer con los préstamos vencidos. El cálculo de vencimiento desde el día siguiente a la fecha pactada y el inicio de un libro como disponible también son decisiones de diseño ante detalles no definidos en el enunciado.
+### 4.1. Módulo de usuarios
 
-## Diseño lógico y técnico
+#### CU-01. Registrar usuario
 
-- **Libros:** identificador, título, autor, género, fecha de publicación y estado. Un libro comienza disponible, puede pasar a mantenimiento y vuelve a disponible; un préstamo lo marca prestado y su devolución lo libera. Por decisión de diseño, el estado prestado no se asigna manualmente: así no queda un libro marcado como prestado sin un préstamo asociado. El enunciado solicita actualizar el estado, pero no establece expresamente esta restricción.
-- **Usuarios:** documento, nombre, apellido y datos de contacto. El documento identifica cada usuario.
-- **Préstamos:** número autogenerado, documento de usuario, identificador de libro, fechas y marca de devolución. Las claves foráneas relacionan los registros. Índices únicos impiden más de un préstamo abierto por libro o usuario.
-- **Estado:** se calcula al consultar: devuelto si se registró la devolución; vencido si sigue abierto después de la fecha pactada; vigente en los demás casos. La fecha de devolución es la fecha pactada, no se guarda la fecha real de entrega.
-- **Proceso de préstamo:** validar fechas y existencia, comprobar usuario sin préstamo abierto y libro disponible, insertar préstamo y cambiar estado del libro en una transacción. Luego generar y enviar el comprobante. La devolución también actualiza ambos registros en una transacción.
-- **Diseño físico:** SQLite almacena las tablas `libros`, `usuarios` y `prestamos` en `BaseDeDatosAplicacion.db`. Las fechas se guardan en formato ISO para su comparación y se presentan en formato solicitado. Se usan consultas SQL parametrizadas. El PDF de una página se construye con la biblioteca estándar; `smtplib` y `email` permiten enviarlo. La información del comprobante se toma de los registros actuales al generarlo; no es una fotografía histórica de datos de contacto.
-- **Alcance:** se permiten fechas de inicio pasadas o futuras, pues el enunciado no las restringe; todo préstamo sin devolver reserva el libro desde su registro. No hay edición de los datos bibliográficos salvo el estado, ni eliminación, porque el enunciado no las solicita.
+-   **Opción del menú:** Usuarios → 1. Crear un usuario nuevo.
+-   **Precondiciones:**
+    -   Existe la base de datos y hay una conexión activa.
+-   **Datos de entrada:**
+    -   Número de identificación.
+    -   Nombres.
+    -   Apellidos.
+    -   Dirección.
+    -   Teléfono.
+    -   Correo electrónico.
+-   **Proceso:**
+    1.  Solicita los datos del usuario.
+    2.  Valida cada entrada mediante expresiones regulares.
+    3.  Inserta el registro en la tabla `usuarios`.
+    4.  Si la inserción afecta una fila, confirma la transacción y
+        muestra un mensaje de éxito.
+-   **Datos de salida:**
+    -   Mensaje de confirmación si el registro se realiza.
+    -   Mensaje de error si no se puede crear el usuario.
+-   **Poscondiciones:**
+    -   Si la operación tiene éxito, el usuario queda almacenado en
+        `usuarios`.
+    -   Si falla, no se confirma la inserción.
 
-### Validación y estandarización de datos
+#### CU-02. Actualizar información de contacto
 
-Los textos digitados se guardan en mayúsculas, admiten hasta 120 caracteres imprimibles y se normalizan también al buscar; los identificadores de libros pueden contener letras y números. Para conservar los ceros iniciales, el documento y el teléfono se almacenan como texto, pero se solicitan únicamente con dígitos (entre 1 y 30, sin espacios ni signos). El número de préstamo es un entero positivo. Las opciones del menú deben ser una de las mostradas. Ante un dato vacío o inválido, el programa explica el formato y vuelve a solicitarlo. Las fechas deben ser reales y tener el formato exacto `dd/mm/aaaa`; la devolución no puede ser anterior al inicio.
+-   **Opción del menú:** Usuarios → 2. Actualizar información de
+    contacto.
+-   **Precondiciones:**
+    -   la base de datos existe y hay una coneccion activa.
+    -   El usuario que se desea modificar debe estar registrado.
+-   **Datos de entrada:**
+    -   Número de identificación del usuario.
+    -   Nueva dirección.
+    -   Nuevo teléfono.
+    -   Nuevo correo electrónico.
+-   **Proceso:**
+    1.  Solicita y valida el número de identificación.
+    2.  Busca al usuario en la tabla `usuarios`.
+    3.  Si no existe, informa el error y termina la operación.
+    4.  Si existe, solicita los nuevos datos de contacto y los valida.
+    5.  Actualiza únicamente `direccion`, `telefono` y `email`.
+    6.  Confirma los cambios si se actualizó una fila.
+-   **Datos de salida:**
+    -   Mensaje de actualización exitosa o mensaje de error.
+-   **Poscondiciones:**
+    -   Si la operación tiene éxito, los datos de contacto quedan
+        actualizados.
+    -   La identificación, los nombres y los apellidos permanecen sin
+        cambios.
 
-El correo también se convierte a mayúsculas por el estándar solicitado. Algunos servidores de correo pueden distinguir mayúsculas en la parte anterior a `@`; confirme que la dirección estandarizada funciona con el proveedor destinatario. Los datos guardados en versiones anteriores no se modifican automáticamente; las búsquedas de identificadores de libro admiten diferencias de mayúsculas y minúsculas ASCII.
+#### CU-03. Consultar información de usuario
 
+-   **Opción del menú:** Usuarios → 3. Consultar información vigente de
+    un usuario.
+-   **Precondiciones:**
+    -   El programa está en ejecución y conectado a la base de datos.
+    -   El usuario debe estar registrado.
+-   **Datos de entrada:**
+    -   Número de identificación.
+-   **Proceso:**
+    1.  Solicita y valida el número de identificación.
+    2.  Busca el registro correspondiente en `usuarios`.
+    3.  Recupera los datos y los presenta en pantalla.
+-   **Datos de salida:**
+    -   Identificación, nombres, apellidos, dirección, teléfono y correo
+        electrónico.
+-   **Poscondiciones:**
+    -   La base de datos no se modifica.
+    -   El usuario obtiene la información almacenada para la
+        identificación consultada.
 
-## Pruebas automáticas
+### 4.2. Módulo de libros
 
-Desde la carpeta `POO2026`, ejecute con Python 3.9.10:
+#### CU-04. Registrar libro
 
-```sh
-python3 -m unittest discover -s proyecto_entrega_1/pruebas -v
-```
+-   **Opción del menú:** Libros → 1. Registrar un libro.
+-   **Precondiciones:**
+    -  La base de datos existe y hay una conexion activa.
+-   **Datos de entrada:**
+    -   Identificador del libro.
+    -   Título.
+    -   Autor.
+    -   Género.
+    -   Fecha de publicación.
+-   **Proceso:**
+    1.  Solicita los datos del libro.
+    2.  Valida las entradas mediante expresiones regulares.
+    3.  Asigna automáticamente el estado `Disponible`.
+    4.  Inserta el registro en la tabla `libros`.
+    5.  Confirma la transacción si la inserción afecta una fila.
+-   **Datos de salida:**
+    -   Mensaje de registro exitoso o mensaje de error.
+-   **Poscondiciones:**
+    -   Si la operación tiene éxito, el libro queda registrado con
+        estado `Disponible`.
+    -   Si falla, la inserción no se confirma.
 
-Las pruebas usan bases de datos en memoria o una carpeta temporal y no modifican `BaseDeDatosAplicacion.db`. Cubren entradas inválidas, fechas, altas y consultas, reglas de préstamo y devolución, consultas parametrizadas, PDF, errores de correo y un recorrido por los menús. El envío SMTP se simula; para verificar la entrega real se necesita un servidor y una cuenta configurados. La ejecución automática reproduce la consola, pero no comprueba la interfaz de IDLE. Ninguna batería de pruebas puede garantizar ausencia total de fallos.
+#### CU-05. Actualizar estado de un libro
 
-### Uso de mayúsculas y componentes de Python
+-   **Opción del menú:** Libros → 2. Actualizar estado de un libro.
+-   **Precondiciones:**
+    -   La base de datos existe y hay una conexion activa.
+    -   El libro debe existir.
+-   **Datos de entrada:**
+    -   Identificador del libro.
+    -   Nuevo estado, seleccionado entre:
+        1.  Disponible.
+        2.  Prestado.
+        3.  En mantenimiento.
+-   **Proceso:**
+    1.  Solicita y valida el identificador.
+    2.  Comprueba que el libro exista.
+    3.  Solicita el nuevo estado y valida que la opción sea de 1 a 3.
+    4.  Convierte la opción seleccionada al texto correspondiente.
+    5.  Actualiza el campo `estado` del libro y confirma la transacción.
+-   **Datos de salida:**
+    -   Mensaje de actualización exitosa o mensaje de error.
+-   **Poscondiciones:**
+    -   Si la operación tiene éxito, el libro queda con el nuevo estado.
+    -   Los demás datos del libro no se modifican.
 
-Las capturas de texto se convierten con `upper()` antes de validarlas y almacenarlas; las opciones del menú también se normalizan. Las búsquedas de identificadores emplean `UPPER()` en SQLite para comparar sin depender de mayúsculas ASCII. Las fechas y los números no tienen mayúsculas. Los estados internos de la base se mantienen con los valores definidos en su estructura. Los datos previos no se convierten automáticamente y `UPPER()` de SQLite solo convierte letras ASCII: un identificador antiguo con letras acentuadas en minúscula puede requerir una corrección manual. Python sí convierte a mayúsculas los caracteres acentuados al capturar datos nuevos.
+#### CU-06. Consultar disponibilidad de un libro
 
-`os` es parte de Python y se usa únicamente para leer las variables de configuración SMTP; no se necesita para conectar la base de datos. Las credenciales no se convierten a mayúsculas porque pueden distinguirlas. `Path(__file__).resolve().parent` obtiene la carpeta que contiene el programa, y se usa para guardar los comprobantes junto a él; no define la ubicación de la base de datos. `PRAGMA foreign_keys = ON` activa la comprobación de las relaciones de SQLite en cada conexión: así un préstamo no puede apuntar a un usuario o libro inexistente.
+-   **Opción del menú:** Libros → 3. Consultar disponibilidad de un
+    libro.
+-   **Precondiciones:**
+    -   La base de datos existe y hay una conexion activa.
+-   **Datos de entrada:**
+    -   Identificador del libro.
+-   **Proceso:**
+    1.  Solicita y valida el identificador.
+    2.  Consulta el campo `estado` en la tabla `libros`.
+    3.  Informa si el libro no existe o muestra el estado encontrado.
+-   **Datos de salida:**
+    -   Estado del libro (`Disponible`, `Prestado` o `En mantenimiento`)
+        o mensaje de inexistencia.
+-   **Poscondiciones:**
+    -   La base de datos no se modifica.
 
-La consulta del catálogo es una función adicional de apoyo: el enunciado exige consultar disponibilidad y datos vigentes, y no prohíbe mostrar una muestra de libros.
+#### CU-07. Consultar datos de un libro
 
-Las muestras de libros, usuarios y préstamos se limitan en SQLite a 100 registros y no representan necesariamente la totalidad de los datos. La consulta del historial por usuario permite recorrer todos sus préstamos en páginas de hasta 100.
+-   **Opción del menú:** Libros → 4. Consultar datos vigentes de un
+    libro.
+-   **Precondiciones:**
+    -   El libro debe existir para obtener sus datos.
+-   **Datos de entrada:**
+    -   Identificador del libro.
+-   **Proceso:**
+    1.  Solicita y valida el identificador.
+    2.  Busca el registro en `libros`.
+    3.  Si existe, muestra todos sus campos; de lo contrario, informa
+        que no existe.
+-   **Datos de salida:**
+    -   Identificador, título, autor, género, fecha de publicación y
+        estado.
+-   **Poscondiciones:**
+    -   La base de datos no se modifica.
+
+### 4.3. Módulo de préstamos
+
+#### CU-08. Registrar préstamo
+
+-   **Opción del menú:** Préstamos → 1. Registrar préstamo.
+-   **Precondiciones:**
+    -   El usuario debe estar registrado.
+    -   El usuario no debe tener otro préstamo con estado `vigente`.
+    -   El libro debe estar registrado y tener estado `Disponible`.
+-   **Datos de entrada:**
+    -   Identificación del usuario.
+    -   Identificador del libro.
+-   **Proceso:**
+    1.  Solicita y valida la identificación del usuario.
+    2.  Comprueba que el usuario exista.
+    3.  Consulta si tiene un préstamo vigente. Si lo tiene, cancela la
+        operación.
+    4.  Solicita y valida el identificador del libro.
+    5.  Comprueba que el libro exista y esté disponible.
+    6.  Calcula la fecha de inicio con la fecha actual y la fecha
+        prevista de devolución siete días después.
+    7.  Inserta el préstamo con estado `vigente`.
+    8.  Recupera el identificador generado automáticamente para el
+        préstamo.
+    9.  Cambia el estado del libro a `Prestado` y confirma los cambios.
+    10. Muestra los datos principales del préstamo y llama a
+        `generar_comprobante_prestamo()` para crear el PDF e intentar
+        enviarlo por correo.
+-   **Datos de salida:**
+    -   Identificador del préstamo.
+    -   Identificación del usuario y del libro.
+    -   Fecha de inicio y fecha prevista de devolución.
+    -   Estado del préstamo.
+    -   Comprobante PDF en la carpeta `comprobantes`.
+    -   Mensaje sobre el resultado del intento de envío del correo.
+-   **Poscondiciones:**
+    -   Si el registro tiene éxito, se crea un préstamo `vigente` y el
+        libro pasa a estado `Prestado`.
+    -   Si falla la inserción, se ejecuta `rollback()` para revertir la
+        transacción.
+    -   La generación o el envío del comprobante se realiza después de
+        confirmar el préstamo; un fallo de correo no equivale a deshacer
+        el préstamo.
+
+#### CU-09. Registrar devolución
+
+-   **Opción del menú:** Préstamos → 2. Registrar devolución de un
+    libro.
+-   **Precondiciones:**
+    -   Debe existir un préstamo con el identificador indicado y estado
+        `vigente`.
+-   **Datos de entrada:**
+    -   Identificador numérico del préstamo.
+-   **Proceso:**
+    1.  Solicita y valida el identificador del préstamo.
+    2.  Busca el préstamo y comprueba que esté vigente.
+    3.  Obtiene el identificador del libro asociado.
+    4.  Registra la fecha actual como fecha de devolución.
+    5.  Cambia el estado del préstamo a `devuelto`.
+    6.  Cambia el estado del libro a `Disponible`.
+    7.  Confirma los cambios y muestra un mensaje de éxito.
+-   **Datos de salida:**
+    -   Mensaje de devolución registrada o mensaje indicando que el
+        préstamo no existe o ya fue devuelto.
+-   **Poscondiciones:**
+    -   El préstamo queda con estado `devuelto` y fecha de devolución
+        actualizada.
+    -   El libro asociado queda con estado `Disponible`.
+
+#### CU-10. Consultar préstamos de un usuario
+
+-   **Opción del menú:** Préstamos → 3. Consultar estado de préstamos
+    por usuario.
+-   **Precondiciones:**
+    -   El usuario debe estar registrado.
+-   **Datos de entrada:**
+    -   Número de identificación del usuario.
+-   **Proceso:**
+    1.  Solicita y valida la identificación.
+    2.  Comprueba que el usuario exista.
+    3.  Consulta los préstamos asociados a la identificación y obtiene
+        el título del libro mediante una unión (inner join) con la tabla `libros`.
+    4.  Ordena los resultados por identificador de préstamo y los
+        presenta en pantalla.
+    5.  Si no hay registros, informa que el usuario no tiene préstamos
+        registrados.
+-   **Datos de salida:**
+    -   Identificación y nombre del usuario.
+    -   Para cada préstamo: identificador, título del libro y estado.
+    -   Mensaje informativo si no existen préstamos.
+-   **Poscondiciones:**
+    -   La base de datos no se modifica.
+
+## 5. Diseño técnico: funciones implementadas
+
+### 5.1. Conexión y funciones auxiliares
+
+  -------------------------------------------------------------------------
+  Función                               Descripción
+  ------------------------------------- -----------------------------------
+  `conectar()`                          Abre una conexión con la base de
+                                        datos SQLite `ParcialDos.db`.
+                                        Devuelve el objeto de conexión para
+                                        que las demás funciones puedan
+                                        ejecutar consultas.
+
+  `validar_dato(regex, nombre_campo)`   Solicita un dato por consola y lo
+                                        compara con la expresión regular
+                                        recibida. Si no cumple el patrón,
+                                        muestra un error y vuelve a
+                                        solicitarlo; si es válido, devuelve
+                                        la cadena ingresada.
+
+  `crear_tablas(DB_con)`                Crea las tablas `libros`,
+                                        `usuarios` y `prestamos` si no
+                                        existen. Define sus claves
+                                        primarias y las claves foráneas de
+                                        préstamos, y confirma la creación
+                                        con `commit()`.
+  -------------------------------------------------------------------------
+
+### 5.2. Módulo de usuarios
+
+  -----------------------------------------------------------------------
+  Función                             Descripción
+  ----------------------------------- -----------------------------------
+  `usuario_nuevo(DB_con)`             Solicita identificación, nombres,
+                                      apellidos, dirección, teléfono y
+                                      correo; valida los campos e inserta
+                                      el nuevo usuario en la tabla
+                                      `usuarios`.
+
+  `actualizar_info_usuario(DB_con)`   Busca un usuario por identificación
+                                      y, si existe, actualiza su
+                                      dirección, teléfono y correo
+                                      electrónico.
+
+  `consultar_usuario(DB_con)`         Busca un usuario por identificación
+                                      y muestra sus datos personales y de
+                                      contacto.
+  -----------------------------------------------------------------------
+
+### 5.3. Módulo de libros
+
+  ------------------------------------------------------------------------------
+  Función                                    Descripción
+  ------------------------------------------ -----------------------------------
+  `libro_nuevo(DB_con)`                      Solicita y valida los datos
+                                             bibliográficos, asigna el estado
+                                             inicial `Disponible` e inserta el
+                                             libro en `libros`.
+
+  `actualizar_estado_libro(DB_con)`          Comprueba la existencia de un
+                                             libro, solicita uno de los tres
+                                             estados permitidos y actualiza su
+                                             campo `estado`.
+
+  `consultar_disponibilidad_libro(DB_con)`   Busca un libro por identificador y
+                                             muestra únicamente su estado o un
+                                             mensaje si no existe.
+
+  `consultar_datos_libro(DB_con)`            Consulta y muestra todos los datos
+                                             almacenados de un libro
+                                             identificado por su código.
+  ------------------------------------------------------------------------------
+
+### 5.4. Módulo de préstamos y comprobantes
+
+  ----------------------------------------------------------------------------------------
+  Función                                              Descripción
+  ---------------------------------------------------- -----------------------------------
+  `prestamo_nuevo(DB_con)`                             Verifica la existencia del usuario,
+                                                       que no tenga un préstamo vigente y
+                                                       que el libro exista y esté
+                                                       disponible. Calcula las fechas,
+                                                       registra el préstamo, actualiza el
+                                                       estado del libro, obtiene el ID
+                                                       generado y solicita la generación
+                                                       del comprobante.
+
+  `registrar_devolucion(DB_con)`                       Busca un préstamo vigente por su
+                                                       ID. Registra la fecha actual como
+                                                       devolución, cambia el préstamo a
+                                                       `devuelto` y devuelve el libro al
+                                                       estado `Disponible`.
+
+  `consultar_prestamos_usuario(DB_con)`                Consulta el historial de préstamos
+                                                       de un usuario mediante una unión
+                                                       entre `prestamos` y `libros`.
+                                                       Muestra el ID, el título y el
+                                                       estado de cada préstamo.
+
+  `generar_comprobante_prestamo(DB_con, idPrestamo)`   Consulta los datos del préstamo,
+                                                       del usuario y del libro mediante
+                                                       `INNER JOIN`; genera un PDF con
+                                                       ReportLab en la carpeta
+                                                       `comprobantes`, construye un correo
+                                                       con el archivo adjunto e intenta
+                                                       enviarlo mediante SMTP con
+                                                       STARTTLS.
+  ----------------------------------------------------------------------------------------
+
+### 5.5. Menús y control del programa
+
+  -----------------------------------------------------------------------
+  Función                             Descripción
+  ----------------------------------- -----------------------------------
+  `menu()`                            Presenta el menú principal y valida
+                                      que la opción ingresada sea una de
+                                      las disponibles. Devuelve el número
+                                      seleccionado o `0` si la entrada no
+                                      es válida.
+
+  `menu_usuarios()`                   Presenta las opciones del módulo de
+                                      usuarios y devuelve la selección
+                                      validada.
+
+  `menu_libros()`                     Presenta las opciones del módulo de
+                                      libros y devuelve la selección
+                                      validada.
+
+  `menu_prestamos()`                  Presenta las opciones del módulo de
+                                      préstamos y devuelve la selección
+                                      validada.
+
+  `main()`                            Es el punto de entrada y
+                                      coordinador general. Abre la
+                                      conexión, crea las tablas, muestra
+                                      el menú principal, dirige la
+                                      ejecución a los submenús y llama a
+                                      la función correspondiente. Al
+                                      seleccionar salir, cierra la
+                                      conexión.
+  -----------------------------------------------------------------------
+
+### 5.6. Variables y validaciones globales
+
+El programa utiliza la variable global `CONTROL` para mantener activo el
+ciclo principal hasta que el usuario selecciona la opción de salir.
+
+También define expresiones regulares reutilizables:
+
+  -----------------------------------------------------------------------
+  Expresión                           Uso
+  ----------------------------------- -----------------------------------
+  `SOLO_TEXTO`                        Valida nombres, apellidos, autores
+                                      y géneros: letras, espacios y
+                                      caracteres acentuados, con un
+                                      máximo de 50 caracteres.
+
+  `SOLO_EMAIL`                        Valida la estructura general de una
+                                      dirección de correo electrónico.
+
+  `SOLO_TELEF`                        Valida números telefónicos
+                                      colombianos móviles o fijos, con
+                                      prefijo `+57` opcional.
+
+  `SOLO_ADDRS`                        Valida direcciones con una
+                                      estructura básica de nomenclatura
+                                      colombiana.
+
+  `TEXTO_LARG`                        Valida textos de hasta 150
+                                      caracteres, utilizados
+                                      principalmente para títulos.
+  -----------------------------------------------------------------------
+
+Además, algunas funciones utilizan expresiones regulares específicas
+para validar identificaciones, códigos de libros, fechas e
+identificadores de préstamos.
+
+## 6. Consideraciones y limitaciones conocidas
+
+-   La validación de fechas de publicación comprueba el formato
+    pero no verifica por sí sola que la fecha exista en el calendario.
+-   La aplicación utiliza consultas SQL construidas mediante cadenas
+    f-string. Haciendolas vulnerables a ataques SQL (mojor seria usar
+    'prepared statements').
+-   Los comandos `cls` y `pause` dependen de la consola de Windows.
+-   El envío de correo está configurado inicialmente para pruebas con
+    Ethereal Email; no representa una entrega real al usuario.
+-   La activación efectiva de claves foráneas en SQLite requiere
+    habilitarlas en la conexión mediante `PRAGMA foreign_keys = ON`, 
+    sentencia que por facilidad del desarroyo se omite.
